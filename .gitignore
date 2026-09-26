@@ -4,3 +4,5 @@
 *.ptx
 *.cubin
 *.fatbin
+models/mbert_adapted/model.safetensors
+.DS_Store
