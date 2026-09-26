@@ -37,8 +37,8 @@
   "pooler_size_per_head": 128,
   "pooler_type": "first_token_transform",
   "tie_word_embeddings": true,
-  "transformers_version": "5.9.0",
+  "transformers_version": "5.17.0",
   "type_vocab_size": 2,
   "use_cache": true,
-  "vocab_size": 120045
+  "vocab_size": 134013
 }

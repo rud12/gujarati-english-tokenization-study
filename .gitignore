@@ -7,3 +7,4 @@
 models/mbert_adapted/model.safetensors
 models/mbert_obpe_adapted/model.safetensors
 .DS_Store
+x
