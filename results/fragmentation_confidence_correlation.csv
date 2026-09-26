@@ -1,0 +1,4 @@
+model_dir,model,pearson_r,p_value,n,significant
+model1,mBERT (baseline),-0.0676,0.0,51161,True
+model2,MuRIL (baseline),-0.0597,0.0,51161,True
+model3,mBERT (adapted),-0.0665,0.0,51161,True

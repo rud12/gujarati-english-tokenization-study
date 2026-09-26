@@ -59,7 +59,7 @@ N_FOLDS_EXPECTED = 5
 KNOWN_MODEL_INFO = {
     "model1": {"label": "mBERT (baseline)", "color": "#e94560"},
     "model2": {"label": "MuRIL (baseline)", "color": "#0f3460"},
-    "model3": {"label": "mBERT (adapted, OBPE)", "color": "#53d8fb"},
+    "model3": {"label": "mBERT (adapted)", "color": "#53d8fb"},
 }
 REFERENCE_MODEL_DIR = "model1"  # used as the fragmentation stratification reference
 

@@ -1,0 +1,22 @@
+{
+  "adapted_vs_baseline": {
+    "comparison": "mBERT (adapted) vs mBERT (baseline)",
+    "n_folds_compared": 5,
+    "mean_diff": 0.003362,
+    "cohens_d": 0.9869,
+    "paired_ttest_p": 0.119659,
+    "wilcoxon_p": 0.1875,
+    "significant_ttest": false,
+    "significant_wilcoxon": false
+  },
+  "muril_vs_baseline": {
+    "comparison": "MuRIL (baseline) vs mBERT (baseline)",
+    "n_folds_compared": 5,
+    "mean_diff": -0.023543,
+    "cohens_d": -5.9144,
+    "paired_ttest_p": 0.000292,
+    "wilcoxon_p": 0.0625,
+    "significant_ttest": true,
+    "significant_wilcoxon": false
+  }
+}

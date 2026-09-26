@@ -1,0 +1,13 @@
+{
+  "model_name": "mBERT_baseline",
+  "label2id": {
+    "negative": 0,
+    "neutral": 1,
+    "positive": 2
+  },
+  "dataset_name": "merged_50k",
+  "n_rows": 51161,
+  "n_folds": 5,
+  "n_epochs": 5,
+  "random_seed": 42
+}
