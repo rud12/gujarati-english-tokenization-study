@@ -312,15 +312,15 @@ def run_training_pipeline(model_name: str, model_path: str, checkpoint_dirname: 
             learning_rate=LEARNING_RATE, weight_decay=0.01,
             eval_strategy="no", save_strategy="no", load_best_model_at_end=False,
             seed=RANDOM_SEED, logging_steps=50, report_to="none",
-            use_cpu=hw["use_cpu"], no_cuda=hw["use_cpu"], fp16=hw["use_fp16"],
+            use_cpu=hw["use_cpu"], fp16=hw["use_fp16"],
             dataloader_num_workers=0, gradient_accumulation_steps=max(1, 32 // hw["batch_size"]),
-            warmup_ratio=0.1,
+            warmup_steps=0.1,
         )
 
         trainer = WeightedTrainer(
             class_weights=weights_tensor, model=model, args=args,
             train_dataset=train_ds, eval_dataset=val_ds,
-            tokenizer=tokenizer, data_collator=collator, compute_metrics=compute_metrics,
+            processing_class=tokenizer, data_collator=collator, compute_metrics=compute_metrics,
         )
 
         print(f"[{model_name}] Training fold {fold_num}...", flush=True)
