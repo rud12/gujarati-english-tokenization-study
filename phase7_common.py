@@ -63,7 +63,7 @@ N_FOLDS = 5
 N_EPOCHS = 5
 N_EPOCHS_FREEZE = 1   # epochs to train ONLY embeddings+head when staged_freeze=True
 LEARNING_RATE = 2e-5
-MAX_SEQ_LEN = 96
+MAX_SEQ_LEN = 128
 
 torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
