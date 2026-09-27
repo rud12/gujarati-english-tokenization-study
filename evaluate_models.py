@@ -169,27 +169,57 @@ def run_paired_tests(name_a, dirname_a, name_b, dirname_b):
         return None
     a_vals = fa.loc[common_folds].values
     b_vals = fb.loc[common_folds].values
-    diff = a_vals - b_vals
+    diff   = a_vals - b_vals
+    n      = len(common_folds)
+
     t_stat, p_ttest = ttest_rel(a_vals, b_vals)
-    try:
-        _, p_wilcoxon = wilcoxon(a_vals, b_vals)
-    except Exception:
+
+    # FIX Issue-3: Wilcoxon signed-rank requires n >= 6 to produce a valid
+    # p-value (with n=5 scipy returns p=1.0 or raises ValueError).
+    # Guard against this and flag clearly in output.
+    WILCOXON_MIN_N = 6
+    if n >= WILCOXON_MIN_N:
+        try:
+            _, p_wilcoxon = wilcoxon(a_vals, b_vals)
+        except Exception:
+            p_wilcoxon = float("nan")
+    else:
         p_wilcoxon = float("nan")
-    cohens_d = float(diff.mean() / diff.std()) if diff.std() > 0 else 0.0
+        print(f"  [NOTE] Wilcoxon skipped for '{name_a} vs {name_b}': "
+              f"n={n} < minimum required n={WILCOXON_MIN_N}. "
+              f"Interpret paired t-test only.")
+
+    # FIX Issue-4: Cohen's d from n=5 differences is very noisy.
+    # Compute a 10,000-sample bootstrap 95% CI around d to quantify uncertainty.
+    cohens_d_raw = float(diff.mean() / diff.std()) if diff.std() > 0 else 0.0
+    rng = np.random.default_rng(42)
+    boot_d = []
+    for _ in range(10_000):
+        samp = rng.choice(diff, size=n, replace=True)
+        d_b = float(samp.mean() / samp.std()) if samp.std() > 0 else 0.0
+        boot_d.append(d_b)
+    d_ci_lo, d_ci_hi = float(np.percentile(boot_d, 2.5)), float(np.percentile(boot_d, 97.5))
+
     result = {
-        "comparison": f"{name_a} vs {name_b}",
-        "n_folds_compared": len(common_folds),
-        "mean_diff": round(float(diff.mean()), 6),
-        "cohens_d": round(cohens_d, 4),
-        "paired_ttest_p": round(float(p_ttest), 6),
-        "wilcoxon_p": round(float(p_wilcoxon), 6) if not np.isnan(p_wilcoxon) else None,
-        "significant_ttest": bool(p_ttest < 0.05),
+        "comparison":          f"{name_a} vs {name_b}",
+        "n_folds_compared":    n,
+        "mean_diff":           round(float(diff.mean()), 6),
+        "cohens_d":            round(cohens_d_raw, 4),
+        "cohens_d_ci95_lo":    round(d_ci_lo, 4),   # bootstrap 95% CI lower bound
+        "cohens_d_ci95_hi":    round(d_ci_hi, 4),   # bootstrap 95% CI upper bound
+        "cohens_d_note":       f"Estimated from n={n} folds; wide CI reflects small sample.",
+        "paired_ttest_p":      round(float(p_ttest), 6),
+        "wilcoxon_p":          round(float(p_wilcoxon), 6) if not np.isnan(p_wilcoxon) else None,
+        "wilcoxon_note":       None if n >= WILCOXON_MIN_N else f"Not computed: n={n} < {WILCOXON_MIN_N}",
+        "significant_ttest":   bool(p_ttest < 0.05),
         "significant_wilcoxon": bool(p_wilcoxon < 0.05) if not np.isnan(p_wilcoxon) else None,
     }
     sig_flag = "significant" if result["significant_ttest"] else "not significant"
-    print(f"  {name_a} vs {name_b}: Δ={result['mean_diff']:+.4f}  d={result['cohens_d']:+.4f}  "
-          f"p={result['paired_ttest_p']:.4f} ({sig_flag}, n={len(common_folds)} folds)")
+    print(f"  {name_a} vs {name_b}: Δ={result['mean_diff']:+.4f}  "
+          f"d={result['cohens_d']:+.4f} [95%CI {d_ci_lo:+.3f}..{d_ci_hi:+.3f}]  "
+          f"p={result['paired_ttest_p']:.4f} ({sig_flag}, n={n} folds)")
     return result
+
 
 sig_results = {}
 if "model3" in models and "model1" in models:

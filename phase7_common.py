@@ -61,6 +61,7 @@ os.environ.setdefault("TRANSFORMERS_CACHE", str(ROOT / "hf_cache"))
 RANDOM_SEED = 42
 N_FOLDS = 5
 N_EPOCHS = 5
+N_EPOCHS_FREEZE = 1   # epochs to train ONLY embeddings+head when staged_freeze=True
 LEARNING_RATE = 2e-5
 MAX_SEQ_LEN = 96
 
@@ -191,13 +192,18 @@ def save_label_map(model_dir: Path, model_name: str, label2id: dict, dataset_nam
         }, f, indent=2, ensure_ascii=False)
 
 
-def run_training_pipeline(model_name: str, model_path: str, checkpoint_dirname: str):
+def run_training_pipeline(model_name: str, model_path: str, checkpoint_dirname: str,
+                          staged_freeze: bool = False):
     """
     Full 5-fold loop for ONE model: trains, evaluates, and saves per-fold
-    aggregate metrics + full per-example predictions (text, true/pred label,
-    correctness, confidence, fragmentation_ratio, is_code_mixed) with
-    resumability. Call from run_phase7_model{1,2,3}.py with that model's
-    config — do not duplicate this logic per script.
+    aggregate metrics + full per-example predictions.
+
+    staged_freeze=True (use for the vocab-adapted model only):
+      Epoch 1   — freeze all BERT encoder layers; only the embedding table
+                  (including the 500 new rows) and the classifier head are updated.
+                  This lets new token embeddings settle before attention layers adapt.
+      Epochs 2+ — all layers unfrozen, standard fine-tuning continues.
+    Call from run_phase7_model{1,2,3}.py.
     """
     import time
     import datetime
@@ -306,11 +312,57 @@ def run_training_pipeline(model_name: str, model_path: str, checkpoint_dirname: 
         collator = DataCollatorWithPadding(tokenizer=tokenizer)
         tmp_dir = str(ROOT / f"tmp_{checkpoint_dirname}_fold{fold_num}")
 
+        # ── Staged freeze: epoch 1 = only embeddings + classifier head ─────
+        # Applies only for vocab-adapted model (staged_freeze=True).
+        # Freezes all BERT encoder layers so the 500 new token embeddings
+        # learn to occupy good positions BEFORE the attention layers adapt.
+        if staged_freeze:
+            print(f"[{model_name}] Staged freeze: training embeddings+head only for "
+                  f"{N_EPOCHS_FREEZE} epoch(s), then unfreezing...")
+            # Freeze everything except embeddings and classifier
+            for name, param in model.named_parameters():
+                is_embedding = "embeddings" in name
+                is_classifier = "classifier" in name
+                param.requires_grad = bool(is_embedding or is_classifier)
+
+            # Phase 1: frozen body
+            freeze_args = TrainingArguments(
+                output_dir=tmp_dir + "_freeze",
+                num_train_epochs=N_EPOCHS_FREEZE,
+                per_device_train_batch_size=hw["batch_size"],
+                per_device_eval_batch_size=hw["batch_size"],
+                learning_rate=LEARNING_RATE * 5,   # higher LR for embeddings
+                weight_decay=0.01,
+                eval_strategy="no", save_strategy="no", load_best_model_at_end=False,
+                seed=RANDOM_SEED, logging_steps=50, report_to="none",
+                use_cpu=hw["use_cpu"], fp16=hw["use_fp16"],
+                dataloader_num_workers=0,
+                warmup_steps=0.1,
+            )
+            freeze_trainer = WeightedTrainer(
+                class_weights=weights_tensor, model=model, args=freeze_args,
+                train_dataset=train_ds, eval_dataset=val_ds,
+                processing_class=tokenizer, data_collator=collator, compute_metrics=compute_metrics,
+            )
+            freeze_trainer.train()
+            del freeze_trainer
+            shutil.rmtree(tmp_dir + "_freeze", ignore_errors=True)
+
+            # Unfreeze all parameters for the remaining epochs
+            for param in model.parameters():
+                param.requires_grad = True
+            print(f"[{model_name}] Unfroze all layers — continuing for {N_EPOCHS - N_EPOCHS_FREEZE} epochs.")
+
+        # ── Main training (all layers) ───────────────────────────────────────
+        remaining_epochs = N_EPOCHS - N_EPOCHS_FREEZE if staged_freeze else N_EPOCHS
         args = TrainingArguments(
-            output_dir=tmp_dir, num_train_epochs=N_EPOCHS,
+            output_dir=tmp_dir, num_train_epochs=remaining_epochs,
             per_device_train_batch_size=hw["batch_size"], per_device_eval_batch_size=hw["batch_size"],
             learning_rate=LEARNING_RATE, weight_decay=0.01,
-            eval_strategy="no", save_strategy="no", load_best_model_at_end=False,
+            # FIX Issue-1: eval per epoch + save best checkpoint so we score the
+            # best epoch, not necessarily the last one.
+            eval_strategy="epoch", save_strategy="epoch", load_best_model_at_end=True,
+            metric_for_best_model="eval_macro_f1", greater_is_better=True,
             seed=RANDOM_SEED, logging_steps=50, report_to="none",
             use_cpu=hw["use_cpu"], fp16=hw["use_fp16"],
             dataloader_num_workers=0, gradient_accumulation_steps=max(1, 32 // hw["batch_size"]),
@@ -326,19 +378,22 @@ def run_training_pipeline(model_name: str, model_path: str, checkpoint_dirname: 
         print(f"[{model_name}] Training fold {fold_num}...", flush=True)
         trainer.train()
 
-        eval_res = trainer.evaluate()
-        acc = eval_res.get("eval_accuracy", 0.0)
-        prec = eval_res.get("eval_macro_precision", 0.0)
-        rec = eval_res.get("eval_macro_recall", 0.0)
-        f1 = eval_res.get("eval_macro_f1", 0.0)
-
-        # The measures the original v2 script never saved: per-example
-        # predictions, confidence, fragmentation ratio, code-mixed flag.
+        # FIX Issue-2: single predict() call — metrics AND logits come from the
+        # same (best-checkpoint) forward pass, so they are guaranteed consistent.
+        # Previously evaluate() + predict() were two separate passes which would
+        # diverge if load_best_model_at_end swaps checkpoints between calls.
+        print(f"[{model_name}] Evaluating + predicting fold {fold_num} (single pass)...", flush=True)
         pred_output = trainer.predict(val_ds)
-        logits = pred_output.predictions
-        probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()
+        logits      = pred_output.predictions                         # (N, num_labels)
+        true_labels = pred_output.label_ids                           # (N,)
+        probs       = torch.softmax(torch.tensor(logits), dim=-1).numpy()
         pred_labels_idx = probs.argmax(axis=-1)
-        confidences = probs.max(axis=-1)
+        confidences     = probs.max(axis=-1)
+
+        acc  = accuracy_score(true_labels, pred_labels_idx)
+        prec = precision_score(true_labels, pred_labels_idx, average="macro", zero_division=0)
+        rec  = recall_score(true_labels, pred_labels_idx, average="macro", zero_division=0)
+        f1   = f1_score(true_labels, pred_labels_idx, average="macro", zero_division=0)
 
         print(f"[{model_name}] Computing fragmentation ratios for fold {fold_num}...")
         frag_ratios = [compute_fragmentation_ratio(t, tokenizer) for t in val_texts]
