@@ -59,7 +59,7 @@ os.environ.setdefault("TRANSFORMERS_CACHE", str(ROOT / "hf_cache"))
 # ── Global config — identical across all three model scripts, do not change
 #    between runs or the fold splits will no longer line up ─────────────────
 RANDOM_SEED = 42
-N_FOLDS = 5
+N_FOLDS = 3
 N_EPOCHS = 5
 N_EPOCHS_FREEZE = 1   # epochs to train ONLY embeddings+head when staged_freeze=True
 LEARNING_RATE = 2e-5
@@ -120,24 +120,24 @@ def load_data():
     Load and standardize the full dataset EXACTLY the same way in every
     model script. Returns (df, label2id, id2label, num_labels, dataset_name).
     """
-    dataset_1 = DATA_PROCESSED / "filtered_clean.csv"
-    dataset_2 = DATA_PROCESSED / "expanded_dev_subset_full.csv"
+    dataset_1 = DATA_PROCESSED / "clean_sample_3000.csv"
+    # dataset_2 = DATA_PROCESSED / "expanded_dev_subset_full.csv"
     dev_subset = DATA_PROCESSED / "dev_subset.csv"
 
     frames = []
     if dataset_1.exists():
         frames.append(pd.read_csv(dataset_1, encoding="utf-8-sig", low_memory=False))
-    if dataset_2.exists():
-        frames.append(pd.read_csv(dataset_2, encoding="utf-8-sig", low_memory=False))
+    # if dataset_2.exists():
+    #     frames.append(pd.read_csv(dataset_2, encoding="utf-8-sig", low_memory=False))
 
     if frames:
         df_raw = pd.concat(frames, ignore_index=True)
         col = "sentiment_label" if "sentiment_label" in df_raw.columns else "label"
         df = df_raw[df_raw[col].notna()].copy()
         dataset_name = "merged_50k" if len(frames) > 1 else dataset_1.name
-    elif dev_subset.exists():
-        df = pd.read_csv(dev_subset, encoding="utf-8", low_memory=False)
-        dataset_name = "dev_subset_3000"
+    # elif dev_subset.exists():
+    #     df = pd.read_csv(dev_subset, encoding="utf-8", low_memory=False)
+    #     dataset_name = "dev_subset_3000"
     else:
         from datasets import load_dataset
         ds = load_dataset("ShrutiPatel3011/gujarati-english-codemixed-sentiment")
