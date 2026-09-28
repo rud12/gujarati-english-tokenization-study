@@ -57,9 +57,10 @@ N_FOLDS_EXPECTED = 5
 # checkpoint dirname -> friendly label/color, used when label_map.json
 # doesn't specify one (kept in sync with run_phase7_model{1,2,3}.py)
 KNOWN_MODEL_INFO = {
-    "model1": {"label": "mBERT (baseline)", "color": "#e94560"},
-    "model2": {"label": "MuRIL (baseline)", "color": "#0f3460"},
-    "model3": {"label": "mBERT (adapted)", "color": "#53d8fb"},
+    "model1": {"label": "mBERT (baseline)",  "color": "#e94560"},
+    "model2": {"label": "MuRIL (baseline)",  "color": "#0f3460"},
+    "model3": {"label": "mBERT (adapted)",   "color": "#53d8fb"},
+    "model4": {"label": "XLM-R (base)",      "color": "#f5a623"},
 }
 REFERENCE_MODEL_DIR = "model1"  # used as the fragmentation stratification reference
 
@@ -108,7 +109,7 @@ print("  LOADING CHECKPOINTS")
 print("=" * 70)
 
 models = {}
-for dirname in ["model1", "model2", "model3"]:
+for dirname in ["model1", "model2", "model3", "model4"]:
     result = load_model(dirname)
     if result is not None:
         info, fold_metrics, predictions = result
@@ -228,6 +229,9 @@ if "model3" in models and "model1" in models:
 if "model2" in models and "model1" in models:
     sig_results["muril_vs_baseline"] = run_paired_tests(
         models["model2"]["info"]["label"], "model2", models["model1"]["info"]["label"], "model1")
+if "model4" in models and "model1" in models:
+    sig_results["xlmr_vs_baseline"] = run_paired_tests(
+        models["model4"]["info"]["label"], "model4", models["model1"]["info"]["label"], "model1")
 
 with open(RESULTS_DIR / "significance_tests.json", "w", encoding="utf-8") as f:
     json.dump(sig_results, f, indent=2, ensure_ascii=False)
