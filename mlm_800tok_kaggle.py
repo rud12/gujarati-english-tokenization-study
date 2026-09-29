@@ -19,7 +19,13 @@ HOW TO RUN:
 # ═══════════════════════════════════════════════════════════════════════════════
 import subprocess, sys
 
-for pkg in ["transformers[torch]", "datasets", "accelerate", "sentencepiece", "nltk"]:
+for pkg in [
+    "transformers==4.57.6",
+    "datasets",
+    "accelerate",
+    "sentencepiece",
+    "nltk"
+]:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
 import os, gc, re, json, math, random, logging, warnings
