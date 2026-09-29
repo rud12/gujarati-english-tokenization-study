@@ -7,8 +7,8 @@ KAGGLE SETUP:
   Dataset  → rud12/gujarati-english-tokenization-study
   Model    → rudrakachhia/mbert-obpe-adapted (transformers / default / 1)
   GPU      → T4 x2  (or T4 x1)
-  Internet → OFF after adding inputs
-  Runtime  → ~8-12 hours total
+  Internet → OFF after package install / local inputs are available
+  Runtime  → typically minutes for the current ~51k corpus on 2×T4; measure actual
 
 HOW TO RUN:
   Just click "Run All" — all 18 cells run in sequence automatically.
@@ -21,21 +21,36 @@ import subprocess, sys
 
 for pkg in [
     "transformers==4.57.6",
-    "datasets",
-    "accelerate",
+    "datasets>=2.15.0,<5.0.0",
+    "accelerate>=1.1.0,<2.0.0",
     "sentencepiece",
     "nltk"
 ]:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
-import os, gc, re, json, math, random, logging, warnings
+import os, gc, re, json, math, random, logging, warnings, inspect
 import numpy as np
 import pandas as pd
 import torch
 import nltk
+import transformers
+import datasets as hf_datasets
+import accelerate
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
+
+EXPECTED_TRANSFORMERS = "4.57.6"
+if transformers.__version__ != EXPECTED_TRANSFORMERS:
+    raise RuntimeError(
+        f"Incompatible Transformers version: {transformers.__version__}. "
+        f"Expected exactly {EXPECTED_TRANSFORMERS}. "
+        "Restart the Kaggle session after changing the pip pin, then Run All."
+    )
+
+print(f"Transformers : {transformers.__version__}")
+print(f"Datasets     : {hf_datasets.__version__}")
+print(f"Accelerate   : {accelerate.__version__}")
 
 from transformers import (
     AutoTokenizer, AutoModelForMaskedLM,
@@ -65,10 +80,12 @@ if torch.cuda.is_available():
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 2 — Configuration  (edit these if needed)
 # ═══════════════════════════════════════════════════════════════════════════════
+ROOT = Path(__file__).resolve().parent
+
 class CFG:
     # ── Kaggle Paths ───────────────────────────────────────────────────────────
-    DATA_DIR   = "data/processed"
-    MODEL_DIR  = "models/mbert_adapted"
+    DATA_DIR   = ROOT / "data" / "processed"
+    MODEL_DIR  = ROOT / "models" / "mbert_adapted"
     OUT_VOCAB  = "/kaggle/working/out/vocab/gujlish_800tok_model"    # expanded vocab model
     OUT_MLM    = "/kaggle/working/out/model/gujlish_mlm_final"       # after MLM training
     CKPT_DIR   = "/kaggle/working/out/cp/mlm_checkpoints"
@@ -96,14 +113,107 @@ class CFG:
     LR_SCHEDULER       = "cosine"
     FP16               = True
     EVAL_RATIO         = 0.02    # 2% for validation
-    EVAL_STEPS         = 500
-    SAVE_STEPS         = 500
+    EVAL_STEPS         = 250
+    SAVE_STEPS         = 250
     SAVE_TOTAL_LIMIT   = 3
     LOGGING_STEPS      = 100
 
+    # ── Safety / reproducibility ──────────────────────────────────────────────
+    EXPECTED_BASE_M_BERT_VOCAB = 119_547
+    EXPECTED_OBPE_ADDITIONS    = 498
+    # Start clean for the first experiment. Set True ONLY when an actual
+    # training run was interrupted and you intentionally want to resume it.
+    RESUME_FROM_CHECKPOINT     = False
+
 for d in [CFG.OUT_VOCAB, CFG.OUT_MLM, CFG.CKPT_DIR, CFG.LOG_DIR]:
     os.makedirs(d, exist_ok=True)
-print("Config ready.")
+# ── Zero-training API preflight ────────────────────────────────────────────────
+# Fail here, before reading/tokenizing the 50k corpus, if the installed Trainer
+# API does not match the script.
+_required_ta = {
+    "output_dir", "overwrite_output_dir", "eval_strategy", "eval_steps",
+    "save_strategy", "save_steps", "load_best_model_at_end",
+    "metric_for_best_model", "greater_is_better", "warmup_ratio",
+    "group_by_length", "prediction_loss_only",
+}
+_ta_params = set(inspect.signature(TrainingArguments).parameters)
+_missing_ta = sorted(_required_ta - _ta_params)
+if _missing_ta:
+    raise RuntimeError(
+        "TrainingArguments API preflight failed. "
+        f"Missing parameters: {_missing_ta}. "
+        f"Transformers={transformers.__version__}"
+    )
+
+_trainer_params = set(inspect.signature(Trainer).parameters)
+if "processing_class" not in _trainer_params:
+    raise RuntimeError(
+        "Trainer API preflight failed: `processing_class` is unavailable. "
+        f"Transformers={transformers.__version__}"
+    )
+
+if tuple(int(x) for x in accelerate.__version__.split('.')[:2]) < (1, 1):
+    raise RuntimeError(
+        f"Accelerate {accelerate.__version__} is too old for data_seed in this script. "
+        "Use accelerate>=1.1.0,<2.0.0."
+    )
+
+_collator_params = set(inspect.signature(DataCollatorForLanguageModeling).parameters)
+_required_collator = {"tokenizer", "mlm", "mlm_probability", "pad_to_multiple_of"}
+_missing_collator = sorted(_required_collator - _collator_params)
+if _missing_collator:
+    raise RuntimeError(
+        "DataCollatorForLanguageModeling API preflight failed. "
+        f"Missing parameters: {_missing_collator}. "
+        f"Transformers={transformers.__version__}"
+    )
+
+_preflight_args = TrainingArguments(
+    output_dir=str(CFG.CKPT_DIR),
+    overwrite_output_dir=True,
+    per_device_train_batch_size=CFG.BATCH_SIZE,
+    per_device_eval_batch_size=CFG.BATCH_SIZE,
+    gradient_accumulation_steps=CFG.GRAD_ACCUM,
+    learning_rate=CFG.LEARNING_RATE,
+    weight_decay=CFG.WEIGHT_DECAY,
+    lr_scheduler_type=CFG.LR_SCHEDULER,
+    warmup_ratio=CFG.WARMUP_RATIO,
+    fp16=CFG.FP16 and torch.cuda.is_available(),
+    eval_strategy="steps",
+    eval_steps=CFG.EVAL_STEPS,
+    save_strategy="steps",
+    save_steps=CFG.SAVE_STEPS,
+    save_total_limit=CFG.SAVE_TOTAL_LIMIT,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
+    logging_dir=str(CFG.LOG_DIR),
+    logging_strategy="steps",
+    logging_steps=CFG.LOGGING_STEPS,
+    report_to="none",
+    seed=SEED,
+    data_seed=SEED,
+    dataloader_num_workers=2,
+    dataloader_pin_memory=True,
+    group_by_length=True,
+    prediction_loss_only=True,
+)
+del _preflight_args
+print("TrainingArguments API preflight: OK")
+
+# NLTK resource preflight. If internet is disabled, the corpus must already be
+# available in the runtime; fail now instead of halfway through the run.
+try:
+    nltk.data.find("corpora/words")
+except LookupError:
+    try:
+        nltk.download("words", quiet=True)
+        nltk.data.find("corpora/words")
+    except LookupError as e:
+        raise RuntimeError(
+            "NLTK corpus 'words' is unavailable. Enable internet once to download it "
+            "or pre-bundle the NLTK words corpus before running offline."
+        ) from e
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 3 — Load Raw Text Corpus
@@ -152,23 +262,57 @@ for s in random.sample(all_texts, min(5, len(all_texts))):
 # CELL 4 — Load OBPE-Adapted Model + Tokenizer
 # ═══════════════════════════════════════════════════════════════════════════════
 def find_model_path(primary):
-    if os.path.exists(primary):
-        return primary
-    # Auto-search under /kaggle/input/
-    print(f"Not found at {primary}. Searching /kaggle/input/ ...")
-    print("Available inputs:", os.listdir("/kaggle/input/"))
-    for root, dirs, files in os.walk("/kaggle/input/"):
-        if "tokenizer_config.json" in files or "vocab.txt" in files:
-            print(f"  Found model at: {root}")
-            return root
+    primary = Path(primary)
+    if primary.exists():
+        return str(primary)
     raise FileNotFoundError(
-        "OBPE-adapted model not found. "
-        "Add 'rudrakachhia/mbert-obpe-adapted' as a Kaggle Model input."
+        f"OBPE-adapted model not found at: {primary}\n"
+        "Place the intended OBPE mBERT model in models/mbert_adapted "
+        "or update CFG.MODEL_DIR."
     )
 
 model_path = find_model_path(CFG.MODEL_DIR)
-tokenizer  = AutoTokenizer.from_pretrained(model_path)
-model      = AutoModelForMaskedLM.from_pretrained(model_path, ignore_mismatched_sizes=False)
+tokenizer = AutoTokenizer.from_pretrained(
+    model_path,
+    local_files_only=True,
+)
+model, loading_info = AutoModelForMaskedLM.from_pretrained(
+    model_path,
+    ignore_mismatched_sizes=False,
+    local_files_only=True,
+    output_loading_info=True,
+)
+
+missing_keys = loading_info.get("missing_keys", [])
+unexpected_keys = loading_info.get("unexpected_keys", [])
+error_msgs = loading_info.get("error_msgs", [])
+
+if error_msgs:
+    raise RuntimeError(
+        "Model loading reported checkpoint errors:\n" + "\n".join(error_msgs[:10])
+    )
+
+if getattr(model.config, "model_type", None) != "bert" or not hasattr(model, "bert"):
+    raise RuntimeError(
+        f"Expected a BERT/mBERT MaskedLM model, got model_type={getattr(model.config, 'model_type', None)!r}."
+    )
+
+missing_mlm_head = [k for k in missing_keys if k.startswith("cls.predictions.")]
+if missing_mlm_head:
+    print("WARNING: MLM prediction-head weights are missing from the source checkpoint:")
+    for k in missing_mlm_head:
+        print(f"  missing: {k}")
+    raise RuntimeError(
+        "The source checkpoint is missing the BERT MLM prediction head. "
+        "This script is intended for continued MLM pre-training, so it refuses "
+        "to spend GPU time training a randomly initialized MLM head. "
+        "Use a checkpoint saved from BertForMaskedLM/AutoModelForMaskedLM instead."
+    )
+
+if unexpected_keys:
+    print(f"WARNING: {len(unexpected_keys)} unexpected checkpoint keys found.")
+    for k in unexpected_keys[:20]:
+        print(f"  unexpected: {k}")
 
 vocab_size_before = len(tokenizer)
 emb_before = model.bert.embeddings.word_embeddings.weight.shape[0]
@@ -179,11 +323,19 @@ assert vocab_size_before == emb_before, (
 )
 
 print(f"Tokenizer vocab size : {vocab_size_before:,}")
-if vocab_size_before >= 120_000:
-    extra = vocab_size_before - 119_547
-    print(f"  ✓ OBPE-adapted confirmed (+{extra} tokens over base mBERT)")
-else:
-    print("  ⚠ WARNING: This looks like base mBERT, not the OBPE-adapted version!")
+expected_obpe_vocab = (
+    CFG.EXPECTED_BASE_M_BERT_VOCAB + CFG.EXPECTED_OBPE_ADDITIONS
+)
+if vocab_size_before != expected_obpe_vocab:
+    raise RuntimeError(
+        f"Unexpected source vocabulary size: {vocab_size_before}. "
+        f"Expected {expected_obpe_vocab} "
+        f"({CFG.EXPECTED_BASE_M_BERT_VOCAB} base + {CFG.EXPECTED_OBPE_ADDITIONS} OBPE)."
+    )
+print(
+    f"  ✓ OBPE-adapted confirmed "
+    f"(+{CFG.EXPECTED_OBPE_ADDITIONS} tokens over base mBERT)"
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 5 — Extract Top Romanized Gujlish Tokens
@@ -264,6 +416,18 @@ for word, info in ranked:
     if len(new_romanized) >= CFG.TARGET_NEW_TOKENS:
         break
 
+if len(new_romanized) != CFG.TARGET_NEW_TOKENS:
+    raise RuntimeError(
+        f"Only {len(new_romanized)} new Romanized tokens found; "
+        f"expected {CFG.TARGET_NEW_TOKENS}."
+    )
+
+# CRITICAL: capture the original WordPiece decomposition BEFORE add_tokens().
+original_subword_pieces = {
+    word: tokenizer.tokenize(word)
+    for word, _ in new_romanized
+}
+
 print(f"\nTop {len(new_romanized)} Romanized Gujlish tokens selected:")
 print(f"{'Word':<20} {'Freq':>8} {'Subwords':>9} {'Score':>8} {'mBERT splits'}")
 print("-" * 75)
@@ -291,44 +455,46 @@ print(f"  Total new tokens over base mBERT: +{len(tokenizer) - 119_547}")
 old_embeddings = model.bert.embeddings.word_embeddings.weight.data.clone()  # [old_vocab, 768]
 old_vocab_size = old_embeddings.shape[0]
 
-# Resize model embeddings to match new tokenizer vocab
-model.resize_token_embeddings(len(tokenizer))
+# Resize model embeddings to match new tokenizer vocab.
+# We initialize the new vectors ourselves, so disable Transformers' default
+# mean/covariance initializer to avoid doing unnecessary work twice.
+model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
 
 print(f"\nEmbedding matrix resized: {old_vocab_size:,} → {len(tokenizer):,}")
 
 # ── Mean initialize ONLY the newly added Romanized tokens ────────────────────
-# (The 498 OBPE tokens added earlier already have good mean-init from the source model)
 new_embedding_layer = model.bert.embeddings.word_embeddings
+global_mean = old_embeddings.mean(dim=0)
 
 with torch.no_grad():
     for word in romanized_words:
         token_id = tokenizer.convert_tokens_to_ids(word)
         if token_id is None or token_id < old_vocab_size:
-            continue  # skip if token already existed
+            raise RuntimeError(f"Invalid new token id for '{word}': {token_id}")
 
-        # Get constituent subword pieces from the ORIGINAL tokenizer state
-        # We use tokenizer.tokenize() on the whole word to get the pieces
-        subword_pieces = tokenizer.tokenize(word)
-        # Filter out the word itself if it tokenizes to itself (already added)
-        subword_pieces = [p for p in subword_pieces if p != word and p != f"##{word}"]
+        # Use the ORIGINAL decomposition captured before add_tokens().
+        subword_pieces = original_subword_pieces[word]
+        piece_ids = tokenizer.convert_tokens_to_ids(subword_pieces)
+        piece_ids = [
+            pid for pid in piece_ids
+            if pid is not None and pid < old_vocab_size
+        ]
 
-        if subword_pieces:
-            # Get embedding IDs of constituent subwords
-            piece_ids = tokenizer.convert_tokens_to_ids(subword_pieces)
-            piece_ids = [pid for pid in piece_ids if pid < old_vocab_size]  # only from old vocab
+        if piece_ids:
+            new_embedding_layer.weight.data[token_id] = old_embeddings[piece_ids].mean(dim=0)
+        else:
+            new_embedding_layer.weight.data[token_id] = global_mean
 
-            if piece_ids:
-                # Mean of constituent subword embeddings
-                piece_embs = old_embeddings[piece_ids]  # [k, 768]
-                mean_emb   = piece_embs.mean(dim=0)      # [768]
-                new_embedding_layer.weight.data[token_id] = mean_emb
-                continue
-
-        # Fallback: use global mean of all embeddings (rare case)
-        new_embedding_layer.weight.data[token_id] = old_embeddings.mean(dim=0)
-
-# Also resize the MLM head output (tied weights in BERT — must match)
+# BERT MLM input/output word embeddings are tied.
 model.tie_weights()
+
+# Fail fast if the 300 new vectors accidentally collapsed to the same vector.
+new_ids = [tokenizer.convert_tokens_to_ids(w) for w in romanized_words]
+new_matrix = new_embedding_layer.weight.data[new_ids]
+pairwise_std = new_matrix.std(dim=0).mean().item()
+if not math.isfinite(pairwise_std) or pairwise_std == 0.0:
+    raise RuntimeError("New Romanized token embeddings are identical; aborting before MLM training.")
+print(f"New-token embedding variability check: {pairwise_std:.6e}")
 
 # ── Final verification ─────────────────────────────────────────────────────────
 final_emb_size = model.bert.embeddings.word_embeddings.weight.shape[0]
@@ -336,10 +502,10 @@ assert final_emb_size == len(tokenizer), (
     f"Mismatch after resize: embedding={final_emb_size}, tokenizer={len(tokenizer)}"
 )
 
-total_added = len(tokenizer) - 119_547
+total_added = len(tokenizer) - CFG.EXPECTED_BASE_M_BERT_VOCAB
 print(f"\n✓ Vocabulary expansion complete")
-print(f"  Base mBERT          : 119,547 tokens")
-print(f"  + Gujarati OBPE     : {vocab_size_before - 119_547} tokens")
+print(f"  Base mBERT          : {CFG.EXPECTED_BASE_M_BERT_VOCAB:,} tokens")
+print(f"  + Gujarati OBPE     : {vocab_size_before - CFG.EXPECTED_BASE_M_BERT_VOCAB} tokens")
 print(f"  + Romanized Gujlish : {num_added} tokens")
 print(f"  ─────────────────────────────────────")
 print(f"  TOTAL vocab size    : {len(tokenizer):,} tokens  (+{total_added} new)")
@@ -353,8 +519,8 @@ model.save_pretrained(CFG.OUT_VOCAB)
 
 # Save token list for documentation
 token_info = {
-    "base_mbert_vocab"      : 119_547,
-    "gujarati_obpe_tokens"  : vocab_size_before - 119_547,
+    "base_mbert_vocab"      : CFG.EXPECTED_BASE_M_BERT_VOCAB,
+    "gujarati_obpe_tokens"  : vocab_size_before - CFG.EXPECTED_BASE_M_BERT_VOCAB,
     "romanized_gujlish_tokens": num_added,
     "total_vocab_size"      : len(tokenizer),
     "total_new_tokens"      : total_added,
@@ -399,6 +565,29 @@ tok_eval  = eval_ds.map(tokenize_fn,  batched=True, batch_size=1000,
 
 print(f"Tokenized train: {len(tok_train):,}  |  eval: {len(tok_eval):,}")
 
+# Verify that the newly added tokens actually occur in the tokenized corpus.
+# If a token never appears, its embedding cannot learn from MLM loss.
+new_token_ids = {tokenizer.convert_tokens_to_ids(w): w for w in romanized_words}
+new_token_counts = Counter()
+for ids in tok_train["input_ids"]:
+    for token_id in ids:
+        if token_id in new_token_ids:
+            new_token_counts[token_id] += 1
+missing_in_train = [
+    word for token_id, word in new_token_ids.items()
+    if new_token_counts[token_id] == 0
+]
+if missing_in_train:
+    raise RuntimeError(
+        f"{len(missing_in_train)} newly added tokens never occur in the training split; "
+        "abort before MLM training. Examples: " + ", ".join(missing_in_train[:20])
+    )
+print(
+    f"New-token corpus coverage: min={min(new_token_counts.values())}, "
+    f"max={max(new_token_counts.values())}, "
+    f"tokens_with_occurrences={sum(v > 0 for v in new_token_counts.values())}/{len(new_token_ids)}"
+)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 10 — Data Collator
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -419,17 +608,16 @@ print(f"Masked tokens: {masked}/{total} = {masked/total:.1%}  (target ~15%)")
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 11 — Training Arguments
 # ═══════════════════════════════════════════════════════════════════════════════
-n_gpus       = max(torch.cuda.device_count(), 1)
-eff_batch    = CFG.BATCH_SIZE * CFG.GRAD_ACCUM * n_gpus
-total_steps  = (len(tok_train) // eff_batch) * CFG.NUM_EPOCHS
-warmup_steps = int(total_steps * CFG.WARMUP_RATIO)
+n_gpus = max(torch.cuda.device_count(), 1)
+approx_global_batch = CFG.BATCH_SIZE * CFG.GRAD_ACCUM * n_gpus
+approx_steps_per_epoch = math.ceil(len(tok_train) / approx_global_batch)
+approx_total_steps = approx_steps_per_epoch * CFG.NUM_EPOCHS
 
-print(f"\nTraining schedule:")
-print(f"  GPUs               : {n_gpus}")
-print(f"  Effective batch    : {eff_batch}")
-print(f"  Total steps        : {total_steps:,}")
-print(f"  Warmup steps       : {warmup_steps:,}")
-print(f"  Estimated time     : ~{total_steps * 0.35 / 3600:.1f} hours (T4 estimate)")
+print(f"\nTraining schedule (approximate):")
+print(f"  GPUs                 : {n_gpus}")
+print(f"  Approx global batch  : {approx_global_batch}")
+print(f"  Approx total steps  : {approx_total_steps:,}")
+print(f"  Warmup ratio         : {CFG.WARMUP_RATIO:.2%}")
 
 training_args = TrainingArguments(
     output_dir                   = CFG.CKPT_DIR,
@@ -445,9 +633,9 @@ training_args = TrainingArguments(
     adam_epsilon                 = 1e-8,
     max_grad_norm                = 1.0,
     lr_scheduler_type            = CFG.LR_SCHEDULER,
-    warmup_steps                 = warmup_steps,
+    warmup_ratio                 = CFG.WARMUP_RATIO,
     fp16                         = CFG.FP16 and torch.cuda.is_available(),
-    evaluation_strategy          = "steps",
+    eval_strategy                = "steps",
     eval_steps                   = CFG.EVAL_STEPS,
     save_strategy                = "steps",
     save_steps                   = CFG.SAVE_STEPS,
@@ -475,16 +663,41 @@ trainer = Trainer(
     args          = training_args,
     train_dataset = tok_train,
     eval_dataset  = tok_eval,
-    tokenizer     = tokenizer,
+    processing_class = tokenizer,
     data_collator = data_collator,
     callbacks     = [
         EarlyStoppingCallback(
-            early_stopping_patience  = 5,
+            early_stopping_patience  = 2,
             early_stopping_threshold = 0.001,
         )
     ],
 )
 print("Trainer ready.")
+
+# One-batch smoke test: validates model + tokenizer + collator + loss + backward
+# on the actual training model before the long run begins. This is intentionally tiny.
+smoke_features = [tok_train[i] for i in range(min(2, len(tok_train)))]
+smoke_batch = data_collator(smoke_features)
+smoke_batch = {
+    k: v.to(training_args.device) if torch.is_tensor(v) else v
+    for k, v in smoke_batch.items()
+}
+model.train()
+smoke_outputs = model(**smoke_batch)
+smoke_loss = smoke_outputs.loss
+if smoke_loss is None or not torch.isfinite(smoke_loss):
+    raise RuntimeError(f"MLM smoke test failed: loss={smoke_loss}")
+smoke_loss.backward()
+smoke_grad_norm_sq = 0.0
+for p in model.parameters():
+    if p.grad is not None:
+        g = p.grad.detach()
+        smoke_grad_norm_sq += float((g.float() ** 2).sum().item())
+model.zero_grad(set_to_none=True)
+smoke_grad_norm = math.sqrt(smoke_grad_norm_sq)
+if not math.isfinite(smoke_grad_norm) or smoke_grad_norm == 0.0:
+    raise RuntimeError(f"MLM smoke test failed: gradient norm={smoke_grad_norm}")
+print(f"MLM one-batch smoke test: OK (loss={smoke_loss.item():.4f}, grad_norm={smoke_grad_norm:.4f})")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 13 — TRAIN
@@ -498,7 +711,11 @@ print(f"  Started    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print("="*65 + "\n")
 
 # Auto-resume if Kaggle session restarted
-last_ckpt = get_last_checkpoint(CFG.CKPT_DIR) if os.path.isdir(CFG.CKPT_DIR) else None
+last_ckpt = (
+    get_last_checkpoint(CFG.CKPT_DIR)
+    if CFG.RESUME_FROM_CHECKPOINT and os.path.isdir(CFG.CKPT_DIR)
+    else None
+)
 if last_ckpt:
     print(f"Resuming from checkpoint: {last_ckpt}")
 
@@ -555,7 +772,7 @@ with open(os.path.join(CFG.OUT_MLM, "mlm_metrics.json"), "w") as f:
         "eval_samples"          : len(tok_eval),
         "total_vocab_size"      : len(tokenizer),
         "new_tokens_total"      : total_added,
-        "gujarati_obpe_tokens"  : vocab_size_before - 119_547,
+        "gujarati_obpe_tokens"  : vocab_size_before - CFG.EXPECTED_BASE_M_BERT_VOCAB,
         "romanized_new_tokens"  : num_added,
         "epochs"                : CFG.NUM_EPOCHS,
         "max_seq_len"           : CFG.MAX_SEQ_LEN,
@@ -568,15 +785,20 @@ with open(os.path.join(CFG.OUT_MLM, "mlm_metrics.json"), "w") as f:
 # ═══════════════════════════════════════════════════════════════════════════════
 print("\nVerifying saved model...")
 from transformers import AutoTokenizer as AT, AutoModelForMaskedLM as AM
-chk_tok = AT.from_pretrained(CFG.OUT_MLM)
-chk_mdl = AM.from_pretrained(CFG.OUT_MLM)
+chk_tok = AT.from_pretrained(CFG.OUT_MLM, local_files_only=True)
+chk_mdl = AM.from_pretrained(CFG.OUT_MLM, local_files_only=True)
 
 assert len(chk_tok) == len(tokenizer)
 assert chk_mdl.bert.embeddings.word_embeddings.weight.shape[0] == len(tokenizer)
+assert hasattr(chk_mdl, "cls") and hasattr(chk_mdl.cls, "predictions")
 print(f"  ✓ Vocab size     : {len(chk_tok):,}")
 print(f"  ✓ Embedding size : {chk_mdl.bert.embeddings.word_embeddings.weight.shape[0]:,}")
 
-del chk_mdl; gc.collect(); torch.cuda.empty_cache()
+del chk_mdl
+del trainer
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 17 — Fill-Mask Sanity Test
@@ -614,15 +836,15 @@ for sent in test_sents:
 print("\n" + "="*65)
 print("  DONE — SUMMARY")
 print("="*65)
-print(f"  Base mBERT vocab     : 119,547 tokens")
-print(f"  + Gujarati OBPE      : +{vocab_size_before - 119_547} tokens")
+print(f"  Base mBERT vocab     : {CFG.EXPECTED_BASE_M_BERT_VOCAB:,} tokens")
+print(f"  + Gujarati OBPE      : +{vocab_size_before - CFG.EXPECTED_BASE_M_BERT_VOCAB} tokens")
 print(f"  + Romanized Gujlish  : +{num_added} tokens")
 print(f"  Final vocab size     : {len(tokenizer):,} tokens")
 print(f"  MLM Perplexity       : {perplexity:.2f}")
 print(f"  Model saved at       : {CFG.OUT_MLM}")
 print()
 print("  NEXT STEPS:")
-print("  1. Upload /kaggle/working/gujlish_mlm_final/ to Kaggle Models")
+print(f"  1. Upload {CFG.OUT_MLM} to Kaggle Models")
 print("  2. Use it in Phase 7 classification (replace rudrakachhia/mbert-obpe-adapted)")
 print("  3. Compare F1 against:")
 print("     - mBERT baseline          : F1 = 0.7377")
