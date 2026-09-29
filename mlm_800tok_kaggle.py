@@ -8,7 +8,7 @@ KAGGLE SETUP:
   Model    → rudrakachhia/mbert-obpe-adapted (transformers / default / 1)
   GPU      → T4 x2  (or T4 x1)
   Internet → OFF after package install / local inputs are available
-  Runtime  → ~20-30 min expected for the current ~51k corpus on 2×T4; measure actual
+  Runtime  → single T4 by design; auto-tunes batch before training to avoid DataParallel OOM
   Warnings  → logged and allowed to continue; only genuine fatal/API/file errors stop.
 
 HOW TO RUN:
@@ -18,7 +18,13 @@ HOW TO RUN:
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 1 — Install & Imports
 # ═══════════════════════════════════════════════════════════════════════════════
-import subprocess, sys
+import os, subprocess, sys
+
+# Kaggle notebook: deliberately use ONE T4. Transformers 4.57 Trainer uses
+# torch.nn.DataParallel for n_gpu>1 in a single process; with a 120k-word MLM head
+# that gathers huge logits onto GPU 0 and can OOM. One T4 avoids that failure mode.
+# The 12-hour Kaggle session limit is still ample for this corpus.
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 for pkg in [
     "transformers==4.57.6",
@@ -29,7 +35,7 @@ for pkg in [
 ]:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
-import os, gc, re, json, math, random, logging, warnings, inspect
+import gc, re, json, math, random, logging, warnings, inspect
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import numpy as np
 import pandas as pd
@@ -111,8 +117,10 @@ class CFG:
     MAX_SEQ_LEN        = 128
     MLM_PROBABILITY    = 0.15
     NUM_EPOCHS         = 3
-    BATCH_SIZE         = 32      # loss-only multi-GPU gather; reduce to 16 only if smoke test OOMs
-    GRAD_ACCUM         = 2       # effective batch = 32 × 2 = 64
+    BATCH_SIZE         = 16      # auto-reduced to 8/4 if the real-batch smoke test OOMs
+    GRAD_ACCUM         = 8       # target effective batch = 128 on the single T4
+    TARGET_GLOBAL_BATCH = 128
+    EVAL_BATCH_SIZE     = 4
     LEARNING_RATE      = 2e-5
     WEIGHT_DECAY       = 0.01
     WARMUP_RATIO       = 0.10
@@ -319,29 +327,7 @@ if unexpected_keys:
     for k in unexpected_keys[:20]:
         print(f"  unexpected: {k}")
 
-# IMPORTANT FOR KAGGLE T4 x2:
-# Trainer uses torch.nn.DataParallel when launched normally from a notebook/script.
-# BertForMaskedLM returns [batch, seq, vocab] logits (~120k vocab), and DataParallel
-# gathers those logits onto GPU 0. That gather can OOM even when each T4 can finish
-# its own forward/backward. We therefore return only the scalar MLM loss whenever
-# labels are supplied. Trainer needs the loss, not the full logits, during training
-# and evaluation. The saved checkpoint remains a normal BertForMaskedLM model and
-# reloads with AutoModelForMaskedLM for downstream use.
-class KaggleLossOnlyBertForMaskedLM(BertForMaskedLM):
-    def forward(self, *args, labels=None, **kwargs):
-        # Transformers 4.57.x may pass this Trainer-only kwarg. BERT does not consume it.
-        kwargs.pop("num_items_in_batch", None)
-        outputs = super().forward(*args, labels=labels, **kwargs)
-        if labels is not None:
-            return MaskedLMOutput(loss=outputs.loss)
-        return outputs
-
-if not isinstance(model, BertForMaskedLM):
-    raise RuntimeError(
-        f"Expected BertForMaskedLM for the memory-safe multi-GPU path, got {type(model).__name__}."
-    )
-model.__class__ = KaggleLossOnlyBertForMaskedLM
-print("Multi-GPU MLM memory guard: enabled (loss-only DataParallel gather)")
+print("Multi-GPU DataParallel disabled: using CUDA_VISIBLE_DEVICES=0 (single T4) for stable MLM training")
 
 vocab_size_before = len(tokenizer)
 emb_before = model.bert.embeddings.word_embeddings.weight.shape[0]
@@ -658,14 +644,76 @@ print(f"Masked tokens: {masked}/{total} = {masked/total:.1%}  (target ~15%)")
 # CELL 11 — Training Arguments
 # ═══════════════════════════════════════════════════════════════════════════════
 n_gpus = max(torch.cuda.device_count(), 1)
-approx_global_batch = CFG.BATCH_SIZE * CFG.GRAD_ACCUM * n_gpus
+if n_gpus != 1:
+    raise RuntimeError(f"Expected exactly 1 visible GPU after CUDA_VISIBLE_DEVICES=0, got {n_gpus}")
+
+# Auto-tune the micro-batch with an actual longest-sequence batch BEFORE training.
+# This is deliberately more realistic than a 2-example smoke test.
+def run_real_batch_smoke(batch_size):
+    indices = sorted(
+        range(len(tok_train)),
+        key=lambda i: len(tok_train[i]["input_ids"]),
+        reverse=True,
+    )[:min(batch_size, len(tok_train))]
+    features = [tok_train[i] for i in indices]
+    batch = data_collator(features)
+    batch = {k: v.to(training_args_device) if torch.is_tensor(v) else v for k, v in batch.items()}
+    model.train()
+    out = model(**batch)
+    loss = out.loss
+    if loss is None or not torch.isfinite(loss):
+        raise RuntimeError(f"Real-batch smoke test produced invalid loss: {loss}")
+    loss.backward()
+    grad_sq = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            g = p.grad.detach()
+            grad_sq += float((g.float() ** 2).sum().item())
+    model.zero_grad(set_to_none=True)
+    if not math.isfinite(grad_sq) or grad_sq <= 0:
+        raise RuntimeError("Real-batch smoke test produced invalid/zero gradients")
+    return loss.item(), math.sqrt(grad_sq), batch["input_ids"].shape
+
+# We need a device before TrainingArguments exists. One visible T4 is CUDA device 0.
+training_args_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model.to(training_args_device)
+chosen_batch = None
+for candidate in [CFG.BATCH_SIZE, 8, 4]:
+    try:
+        smoke_loss, smoke_grad_norm, smoke_shape = run_real_batch_smoke(candidate)
+        chosen_batch = candidate
+        print(
+            f"Real-batch smoke test: OK | batch={candidate} | shape={tuple(smoke_shape)} "
+            f"| loss={smoke_loss:.4f} | grad_norm={smoke_grad_norm:.4f}"
+        )
+        break
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        print(f"WARNING: batch={candidate} hit CUDA OOM during preflight; trying a smaller batch.")
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+if chosen_batch is None:
+    raise RuntimeError("No safe per-device batch size (16, 8, or 4) fit the single T4 during preflight.")
+
+CFG.BATCH_SIZE = chosen_batch
+if CFG.TARGET_GLOBAL_BATCH % CFG.BATCH_SIZE != 0:
+    raise RuntimeError(
+        f"TARGET_GLOBAL_BATCH={CFG.TARGET_GLOBAL_BATCH} is not divisible by chosen batch {CFG.BATCH_SIZE}."
+    )
+CFG.GRAD_ACCUM = CFG.TARGET_GLOBAL_BATCH // CFG.BATCH_SIZE
+
+approx_global_batch = CFG.BATCH_SIZE * CFG.GRAD_ACCUM
 approx_steps_per_epoch = math.ceil(len(tok_train) / approx_global_batch)
 approx_total_steps = approx_steps_per_epoch * CFG.NUM_EPOCHS
 
-print(f"\nTraining schedule (approximate):")
-print(f"  GPUs                 : {n_gpus}")
-print(f"  Approx global batch  : {approx_global_batch}")
-print(f"  Approx total steps  : {approx_total_steps:,}")
+print(f"\nTraining schedule (safe single-T4 configuration):")
+print(f"  Visible GPUs         : {n_gpus}")
+print(f"  Per-device batch     : {CFG.BATCH_SIZE}")
+print(f"  Gradient accumulation: {CFG.GRAD_ACCUM}")
+print(f"  Effective batch      : {approx_global_batch}")
+print(f"  Approx total steps   : {approx_total_steps:,}")
 print(f"  Warmup ratio         : {CFG.WARMUP_RATIO:.2%}")
 
 training_args = TrainingArguments(
@@ -673,7 +721,7 @@ training_args = TrainingArguments(
     overwrite_output_dir         = True,
     num_train_epochs             = CFG.NUM_EPOCHS,
     per_device_train_batch_size  = CFG.BATCH_SIZE,
-    per_device_eval_batch_size   = CFG.BATCH_SIZE,
+    per_device_eval_batch_size   = CFG.EVAL_BATCH_SIZE,
     gradient_accumulation_steps  = CFG.GRAD_ACCUM,
     learning_rate                = CFG.LEARNING_RATE,
     weight_decay                 = CFG.WEIGHT_DECAY,
@@ -684,6 +732,7 @@ training_args = TrainingArguments(
     lr_scheduler_type            = CFG.LR_SCHEDULER,
     warmup_ratio                 = CFG.WARMUP_RATIO,
     fp16                         = CFG.FP16 and torch.cuda.is_available(),
+    gradient_checkpointing       = True,
     eval_strategy                = "steps",
     eval_steps                   = CFG.EVAL_STEPS,
     save_strategy                = "steps",
@@ -722,56 +771,6 @@ trainer = Trainer(
     ],
 )
 print("Trainer ready.")
-
-# One-batch smoke test: validates model + tokenizer + collator + loss + backward
-# on the actual training model before the long run begins. This is intentionally tiny.
-smoke_features = [tok_train[i] for i in range(min(2, len(tok_train)))]
-smoke_batch = data_collator(smoke_features)
-smoke_batch = {
-    k: v.to(training_args.device) if torch.is_tensor(v) else v
-    for k, v in smoke_batch.items()
-}
-model.train()
-smoke_outputs = model(**smoke_batch)
-smoke_loss = smoke_outputs.loss
-if smoke_loss is None or not torch.isfinite(smoke_loss):
-    raise RuntimeError(f"MLM smoke test failed: loss={smoke_loss}")
-smoke_loss.backward()
-smoke_grad_norm_sq = 0.0
-for p in model.parameters():
-    if p.grad is not None:
-        g = p.grad.detach()
-        smoke_grad_norm_sq += float((g.float() ** 2).sum().item())
-model.zero_grad(set_to_none=True)
-smoke_grad_norm = math.sqrt(smoke_grad_norm_sq)
-if not math.isfinite(smoke_grad_norm) or smoke_grad_norm == 0.0:
-    raise RuntimeError(f"MLM smoke test failed: gradient norm={smoke_grad_norm}")
-print(f"MLM one-batch smoke test: OK (loss={smoke_loss.item():.4f}, grad_norm={smoke_grad_norm:.4f})")
-
-# Verify the exact multi-GPU path used by Trainer before committing to the full run.
-# This catches the previous DataParallel logits-gather OOM without consuming a long run.
-if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-    try:
-        dp_smoke = torch.nn.DataParallel(model, device_ids=list(range(torch.cuda.device_count())))
-        dp_features = [tok_train[i] for i in range(min(4, len(tok_train)))]
-        dp_batch = data_collator(dp_features)
-        dp_out = dp_smoke(**{
-            k: v.cuda(non_blocking=True) if torch.is_tensor(v) else v
-            for k, v in dp_batch.items()
-        })
-        dp_loss = dp_out.loss
-        if dp_loss is None or not torch.isfinite(dp_loss):
-            raise RuntimeError(f"Multi-GPU smoke test produced invalid loss: {dp_loss}")
-        print(f"Multi-GPU DataParallel smoke test: OK (loss={dp_loss.item():.4f})")
-        del dp_smoke, dp_out, dp_batch, dp_features
-        torch.cuda.empty_cache()
-    except torch.cuda.OutOfMemoryError as e:
-        # Do not silently start a long run that will immediately OOM.
-        torch.cuda.empty_cache()
-        raise RuntimeError(
-            "Multi-GPU smoke test hit CUDA OOM even with loss-only gathering. "
-            "Reduce BATCH_SIZE before starting the expensive run."
-        ) from e
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 13 — TRAIN
