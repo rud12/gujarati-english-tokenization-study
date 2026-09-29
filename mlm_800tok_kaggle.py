@@ -8,7 +8,7 @@ KAGGLE SETUP:
   Model    → rudrakachhia/mbert-obpe-adapted (transformers / default / 1)
   GPU      → T4 x2  (or T4 x1)
   Internet → OFF after package install / local inputs are available
-  Runtime  → typically minutes for the current ~51k corpus on 2×T4; measure actual
+  Runtime  → ~20-30 min expected for the current ~51k corpus on 2×T4; measure actual
   Warnings  → logged and allowed to continue; only genuine fatal/API/file errors stop.
 
 HOW TO RUN:
@@ -30,6 +30,7 @@ for pkg in [
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
 import os, gc, re, json, math, random, logging, warnings, inspect
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import numpy as np
 import pandas as pd
 import torch
@@ -54,13 +55,14 @@ print(f"Datasets     : {hf_datasets.__version__}")
 print(f"Accelerate   : {accelerate.__version__}")
 
 from transformers import (
-    AutoTokenizer, AutoModelForMaskedLM,
+    AutoTokenizer, AutoModelForMaskedLM, BertForMaskedLM,
     DataCollatorForLanguageModeling,
     TrainingArguments, Trainer,
     EarlyStoppingCallback, set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
 from datasets import Dataset
+from transformers.modeling_outputs import MaskedLMOutput
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO)
@@ -109,7 +111,7 @@ class CFG:
     MAX_SEQ_LEN        = 128
     MLM_PROBABILITY    = 0.15
     NUM_EPOCHS         = 3
-    BATCH_SIZE         = 32      # reduce to 16 if you get OOM errors
+    BATCH_SIZE         = 32      # loss-only multi-GPU gather; reduce to 16 only if smoke test OOMs
     GRAD_ACCUM         = 2       # effective batch = 32 × 2 = 64
     LEARNING_RATE      = 2e-5
     WEIGHT_DECAY       = 0.01
@@ -316,6 +318,30 @@ if unexpected_keys:
     print(f"WARNING: {len(unexpected_keys)} unexpected checkpoint keys found.")
     for k in unexpected_keys[:20]:
         print(f"  unexpected: {k}")
+
+# IMPORTANT FOR KAGGLE T4 x2:
+# Trainer uses torch.nn.DataParallel when launched normally from a notebook/script.
+# BertForMaskedLM returns [batch, seq, vocab] logits (~120k vocab), and DataParallel
+# gathers those logits onto GPU 0. That gather can OOM even when each T4 can finish
+# its own forward/backward. We therefore return only the scalar MLM loss whenever
+# labels are supplied. Trainer needs the loss, not the full logits, during training
+# and evaluation. The saved checkpoint remains a normal BertForMaskedLM model and
+# reloads with AutoModelForMaskedLM for downstream use.
+class KaggleLossOnlyBertForMaskedLM(BertForMaskedLM):
+    def forward(self, *args, labels=None, **kwargs):
+        # Transformers 4.57.x may pass this Trainer-only kwarg. BERT does not consume it.
+        kwargs.pop("num_items_in_batch", None)
+        outputs = super().forward(*args, labels=labels, **kwargs)
+        if labels is not None:
+            return MaskedLMOutput(loss=outputs.loss)
+        return outputs
+
+if not isinstance(model, BertForMaskedLM):
+    raise RuntimeError(
+        f"Expected BertForMaskedLM for the memory-safe multi-GPU path, got {type(model).__name__}."
+    )
+model.__class__ = KaggleLossOnlyBertForMaskedLM
+print("Multi-GPU MLM memory guard: enabled (loss-only DataParallel gather)")
 
 vocab_size_before = len(tokenizer)
 emb_before = model.bert.embeddings.word_embeddings.weight.shape[0]
@@ -721,6 +747,31 @@ smoke_grad_norm = math.sqrt(smoke_grad_norm_sq)
 if not math.isfinite(smoke_grad_norm) or smoke_grad_norm == 0.0:
     raise RuntimeError(f"MLM smoke test failed: gradient norm={smoke_grad_norm}")
 print(f"MLM one-batch smoke test: OK (loss={smoke_loss.item():.4f}, grad_norm={smoke_grad_norm:.4f})")
+
+# Verify the exact multi-GPU path used by Trainer before committing to the full run.
+# This catches the previous DataParallel logits-gather OOM without consuming a long run.
+if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+    try:
+        dp_smoke = torch.nn.DataParallel(model, device_ids=list(range(torch.cuda.device_count())))
+        dp_features = [tok_train[i] for i in range(min(4, len(tok_train)))]
+        dp_batch = data_collator(dp_features)
+        dp_out = dp_smoke(**{
+            k: v.cuda(non_blocking=True) if torch.is_tensor(v) else v
+            for k, v in dp_batch.items()
+        })
+        dp_loss = dp_out.loss
+        if dp_loss is None or not torch.isfinite(dp_loss):
+            raise RuntimeError(f"Multi-GPU smoke test produced invalid loss: {dp_loss}")
+        print(f"Multi-GPU DataParallel smoke test: OK (loss={dp_loss.item():.4f})")
+        del dp_smoke, dp_out, dp_batch, dp_features
+        torch.cuda.empty_cache()
+    except torch.cuda.OutOfMemoryError as e:
+        # Do not silently start a long run that will immediately OOM.
+        torch.cuda.empty_cache()
+        raise RuntimeError(
+            "Multi-GPU smoke test hit CUDA OOM even with loss-only gathering. "
+            "Reduce BATCH_SIZE before starting the expensive run."
+        ) from e
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 13 — TRAIN
