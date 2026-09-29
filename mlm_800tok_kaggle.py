@@ -9,6 +9,7 @@ KAGGLE SETUP:
   GPU      → T4 x2  (or T4 x1)
   Internet → OFF after package install / local inputs are available
   Runtime  → typically minutes for the current ~51k corpus on 2×T4; measure actual
+  Warnings  → logged and allowed to continue; only genuine fatal/API/file errors stop.
 
 HOW TO RUN:
   Just click "Run All" — all 18 cells run in sequence automatically.
@@ -63,6 +64,9 @@ from datasets import Dataset
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO)
+
+def warn_and_continue(message):
+    print(f"WARNING: {message}")
 
 SEED = 42
 set_seed(SEED); random.seed(SEED); np.random.seed(SEED)
@@ -299,15 +303,14 @@ if getattr(model.config, "model_type", None) != "bert" or not hasattr(model, "be
 
 missing_mlm_head = [k for k in missing_keys if k.startswith("cls.predictions.")]
 if missing_mlm_head:
-    print("WARNING: MLM prediction-head weights are missing from the source checkpoint:")
+    print("WARNING: MLM prediction-head weights are missing from the source checkpoint.")
+    print("         The BERT encoder will be loaded from the checkpoint, while the")
+    print("         missing MLM-head parameters will be initialized by Transformers")
+    print("         and trained during this MLM run.")
+    print("         This is valid training, but it is NOT strict continuation from")
+    print("         a checkpoint that already contained a trained MLM prediction head.")
     for k in missing_mlm_head:
         print(f"  missing: {k}")
-    raise RuntimeError(
-        "The source checkpoint is missing the BERT MLM prediction head. "
-        "This script is intended for continued MLM pre-training, so it refuses "
-        "to spend GPU time training a randomly initialized MLM head. "
-        "Use a checkpoint saved from BertForMaskedLM/AutoModelForMaskedLM instead."
-    )
 
 if unexpected_keys:
     print(f"WARNING: {len(unexpected_keys)} unexpected checkpoint keys found.")
@@ -417,9 +420,9 @@ for word, info in ranked:
         break
 
 if len(new_romanized) != CFG.TARGET_NEW_TOKENS:
-    raise RuntimeError(
+    warn_and_continue(
         f"Only {len(new_romanized)} new Romanized tokens found; "
-        f"expected {CFG.TARGET_NEW_TOKENS}."
+        f"target was {CFG.TARGET_NEW_TOKENS}. Continuing with the available tokens."
     )
 
 # CRITICAL: capture the original WordPiece decomposition BEFORE add_tokens().
@@ -445,6 +448,12 @@ romanized_words = [w for w, _ in new_romanized]
 print(f"\nAdding {len(romanized_words)} Romanized Gujlish tokens to vocabulary...")
 num_added = tokenizer.add_tokens(romanized_words)
 print(f"  Tokens successfully added: {num_added}")
+if num_added != len(romanized_words):
+    warn_and_continue(
+        f"Tokenizer added {num_added} tokens but {len(romanized_words)} were requested. "
+        "Continuing with successfully added tokens only."
+    )
+    romanized_words = [w for w in romanized_words if tokenizer.convert_tokens_to_ids(w) is not None]
 print(f"  Vocab size: {vocab_size_before:,} → {len(tokenizer):,}")
 print(f"  Total new tokens over base mBERT: +{len(tokenizer) - 119_547}")
 
@@ -466,14 +475,19 @@ print(f"\nEmbedding matrix resized: {old_vocab_size:,} → {len(tokenizer):,}")
 new_embedding_layer = model.bert.embeddings.word_embeddings
 global_mean = old_embeddings.mean(dim=0)
 
+initialized_words = []
 with torch.no_grad():
     for word in romanized_words:
         token_id = tokenizer.convert_tokens_to_ids(word)
         if token_id is None or token_id < old_vocab_size:
-            raise RuntimeError(f"Invalid new token id for '{word}': {token_id}")
+            warn_and_continue(
+                f"Could not initialize newly added token '{word}' (id={token_id}). "
+                "Skipping that token instead of aborting the run."
+            )
+            continue
 
         # Use the ORIGINAL decomposition captured before add_tokens().
-        subword_pieces = original_subword_pieces[word]
+        subword_pieces = original_subword_pieces.get(word, [])
         piece_ids = tokenizer.convert_tokens_to_ids(subword_pieces)
         piece_ids = [
             pid for pid in piece_ids
@@ -483,7 +497,12 @@ with torch.no_grad():
         if piece_ids:
             new_embedding_layer.weight.data[token_id] = old_embeddings[piece_ids].mean(dim=0)
         else:
+            warn_and_continue(
+                f"No valid original subword pieces found for '{word}'. "
+                "Using the global embedding mean as fallback."
+            )
             new_embedding_layer.weight.data[token_id] = global_mean
+        initialized_words.append(word)
 
 # BERT MLM input/output word embeddings are tied.
 model.tie_weights()
@@ -493,7 +512,10 @@ new_ids = [tokenizer.convert_tokens_to_ids(w) for w in romanized_words]
 new_matrix = new_embedding_layer.weight.data[new_ids]
 pairwise_std = new_matrix.std(dim=0).mean().item()
 if not math.isfinite(pairwise_std) or pairwise_std == 0.0:
-    raise RuntimeError("New Romanized token embeddings are identical; aborting before MLM training.")
+    warn_and_continue(
+        "New Romanized token embeddings have zero/invalid variability. "
+        "Continuing anyway; this may reduce the benefit of vocabulary expansion."
+    )
 print(f"New-token embedding variability check: {pairwise_std:.6e}")
 
 # ── Final verification ─────────────────────────────────────────────────────────
@@ -578,9 +600,10 @@ missing_in_train = [
     if new_token_counts[token_id] == 0
 ]
 if missing_in_train:
-    raise RuntimeError(
-        f"{len(missing_in_train)} newly added tokens never occur in the training split; "
-        "abort before MLM training. Examples: " + ", ".join(missing_in_train[:20])
+    warn_and_continue(
+        f"{len(missing_in_train)} newly added tokens never occur in the training split. "
+        "Their embeddings may receive little or no MLM learning. Examples: "
+        + ", ".join(missing_in_train[:20])
     )
 print(
     f"New-token corpus coverage: min={min(new_token_counts.values())}, "
@@ -778,6 +801,13 @@ with open(os.path.join(CFG.OUT_MLM, "mlm_metrics.json"), "w") as f:
         "max_seq_len"           : CFG.MAX_SEQ_LEN,
         "mlm_probability"       : CFG.MLM_PROBABILITY,
         "learning_rate"         : CFG.LEARNING_RATE,
+        "missing_mlm_head_keys_at_load": missing_mlm_head,
+        "mlm_head_initialized_during_load": bool(missing_mlm_head),
+        "new_tokens_requested": CFG.TARGET_NEW_TOKENS,
+        "new_tokens_selected": len(new_romanized),
+        "new_tokens_added": num_added,
+        "new_tokens_initialized": len(initialized_words),
+        "new_tokens_missing_from_train": len(missing_in_train),
     }, f, indent=2)
 
 # ═══════════════════════════════════════════════════════════════════════════════
