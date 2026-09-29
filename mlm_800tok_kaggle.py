@@ -61,12 +61,12 @@ if torch.cuda.is_available():
 # ═══════════════════════════════════════════════════════════════════════════════
 class CFG:
     # ── Kaggle Paths ───────────────────────────────────────────────────────────
-    DATA_DIR   = "/kaggle/input/gujarati-english-tokenization-study"
-    MODEL_DIR  = "/kaggle/input/mbert-obpe-adapted/transformers/default/1"
-    OUT_VOCAB  = "/kaggle/working/gujlish_800tok_model"    # expanded vocab model
-    OUT_MLM    = "/kaggle/working/gujlish_mlm_final"       # after MLM training
-    CKPT_DIR   = "/kaggle/working/mlm_checkpoints"
-    LOG_DIR    = "/kaggle/working/mlm_logs"
+    DATA_DIR   = "data/processed"
+    MODEL_DIR  = "models/mbert-adapted"
+    OUT_VOCAB  = "/kaggle/working/out/vocab/gujlish_800tok_model"    # expanded vocab model
+    OUT_MLM    = "/kaggle/working/out/model/gujlish_mlm_final"       # after MLM training
+    CKPT_DIR   = "/kaggle/working/out/cp/mlm_checkpoints"
+    LOG_DIR    = "/kaggle/working/out/log/mlm_logs"
 
     # ── CSV column name containing text ───────────────────────────────────────
     TEXT_COL   = "text"          # change if your CSVs use a different column
