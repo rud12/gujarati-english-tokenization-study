@@ -59,11 +59,11 @@ os.environ.setdefault("TRANSFORMERS_CACHE", str(ROOT / "hf_cache"))
 # ── Global config — identical across all three model scripts, do not change
 #    between runs or the fold splits will no longer line up ─────────────────
 RANDOM_SEED = 42
-N_FOLDS = 3
+N_FOLDS = 5
 N_EPOCHS = 5
 N_EPOCHS_FREEZE = 1   # epochs to train ONLY embeddings+head when staged_freeze=True
 LEARNING_RATE = 2e-5
-MAX_SEQ_LEN = 96
+MAX_SEQ_LEN = 128
 
 torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
