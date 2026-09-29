@@ -1,5 +1,5 @@
 """
-PHASE A — Vocabulary Expansion + MLM Pre-Training
+PHASE A — Vocabulary Expansion + MLM Pre-Training (NaN-safe collator) 
 Adds ~800 tokens to mBERT (498 Gujarati OBPE + ~300 Romanized Gujlish)
 then runs Masked Language Model continued pre-training on 51k Gujlish corpus.
 
@@ -179,6 +179,14 @@ if _missing_collator:
     raise RuntimeError(
         "DataCollatorForLanguageModeling API preflight failed. "
         f"Missing parameters: {_missing_collator}. "
+        f"Transformers={transformers.__version__}"
+    )
+
+_mask_params = set(inspect.signature(DataCollatorForLanguageModeling.torch_mask_tokens).parameters)
+if "offset_mapping" not in _mask_params:
+    raise RuntimeError(
+        "DataCollatorForLanguageModeling.torch_mask_tokens API preflight failed: "
+        "expected `offset_mapping` for Transformers 4.57.x. "
         f"Transformers={transformers.__version__}"
     )
 
@@ -634,8 +642,14 @@ class SafeMLMCollator(DataCollatorForLanguageModeling):
     cross-entropy can become 0/0 and return NaN. This preserves normal BERT MLM
     masking and only forces one target when a row would otherwise have none.
     """
-    def torch_mask_tokens(self, inputs, special_tokens_mask=None):
-        inputs, labels = super().torch_mask_tokens(inputs, special_tokens_mask)
+    def torch_mask_tokens(self, inputs, special_tokens_mask=None, offset_mapping=None):
+        # Transformers 4.57.x passes offset_mapping into this method. Accept it
+        # explicitly and forward it unchanged so the collator stays API-compatible.
+        inputs, labels = super().torch_mask_tokens(
+            inputs,
+            special_tokens_mask=special_tokens_mask,
+            offset_mapping=offset_mapping,
+        )
 
         for row in range(labels.size(0)):
             if (labels[row] != -100).any():
