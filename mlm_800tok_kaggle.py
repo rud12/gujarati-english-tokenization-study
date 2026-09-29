@@ -62,7 +62,7 @@ if torch.cuda.is_available():
 class CFG:
     # ── Kaggle Paths ───────────────────────────────────────────────────────────
     DATA_DIR   = "data/processed"
-    MODEL_DIR  = "models/mbert-adapted"
+    MODEL_DIR  = "models/mbert_adapted"
     OUT_VOCAB  = "/kaggle/working/out/vocab/gujlish_800tok_model"    # expanded vocab model
     OUT_MLM    = "/kaggle/working/out/model/gujlish_mlm_final"       # after MLM training
     CKPT_DIR   = "/kaggle/working/out/cp/mlm_checkpoints"
