@@ -1,31 +1,30 @@
 """
-PHASE A — Vocabulary Expansion + MLM Pre-Training (NaN-safe collator) 
-Adds ~800 tokens to mBERT (498 Gujarati OBPE + ~300 Romanized Gujlish)
+PHASE A — Vocabulary Expansion + MLM Pre-Training (NaN-safe collator)
+Adds ~800 tokens to mBERT (500 Gujarati OBPE + ~300 Romanized Gujlish)
 then runs Masked Language Model continued pre-training on 51k Gujlish corpus.
 
 KAGGLE SETUP:
   Dataset  → rud12/gujarati-english-tokenization-study
   Model    → rudrakachhia/mbert-obpe-adapted (transformers / default / 1)
-  GPU      → T4 x2  (or T4 x1)
-  Internet → OFF after package install / local inputs are available
-  Runtime  → single T4 by design; auto-tunes batch before training to avoid DataParallel OOM
-  Warnings  → logged and allowed to continue; only genuine fatal/API/file errors stop.
+  GPU      → single T4 (CUDA_VISIBLE_DEVICES=0 is forced)
+  Internet → needed once for BASE_MODEL + NLTK words
 
-HOW TO RUN:
-  Just click "Run All" — all 18 cells run in sequence automatically.
+V3 CHANGES
+  * FIX: the adapted checkpoint has 120,045 embedding rows while its config/tokenizer
+    say 120,047. BertModel.from_pretrained crashed with a size mismatch. The adapted
+    weights are now loaded MANUALLY: the 120,045 existing embedding rows are copied and
+    the last 2 rows keep their default init (learned during MLM training).
+  * Output-bias head reference is kept consistent (head.bias is decoder.bias).
+  * Docstring: OBPE additions = 500 (120,047 - 119,547).
 
-V2 CHANGES (vs. first run: eval loss 4.05 / ppl 57.5, fill-mask ~ unigram guesses)
+V2 CHANGES
   1. MLM model is built from the ORIGINAL pretrained bert-base-multilingual-cased
-     (which ships a trained MLM head). The OBPE-adapted encoder/embeddings are copied
-     in on top. v1 started from a randomly initialised head (first loss ~13).
-     -> needs BASE_MODEL reachable (Internet ON once, or attach it as a Kaggle Model
-        and point CFG.BASE_MODEL at that path).
-  2. 20 epochs, LR 5e-5, warmup 6%, gradient checkpointing off (was never needed).
-  3. New tokens are added with single_word=True (no matches inside longer words) and
-     Capitalized variants are added too (cased model: "Bhai" != "bhai").
-  4. New-token output biases initialised too; junk tokens (repeated chars, 's) filtered.
-  5. Held-out files are excluded from the MLM corpus (leakage guard).
-  6. Step-0 eval loss is printed, so you can verify the head transplant worked.
+     (trained MLM head); the OBPE-adapted encoder/embeddings are copied on top.
+  2. 20 epochs, LR 5e-5, warmup 6%, no gradient checkpointing.
+  3. New tokens added with single_word=True, plus Capitalized variants.
+  4. New-token output biases initialised; junk tokens filtered.
+  5. Held-out files excluded from the MLM corpus.
+  6. Step-0 eval loss printed to verify the head transplant.
 """
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -33,10 +32,7 @@ V2 CHANGES (vs. first run: eval loss 4.05 / ppl 57.5, fill-mask ~ unigram guesse
 # ═══════════════════════════════════════════════════════════════════════════════
 import os, subprocess, sys
 
-# Kaggle notebook: deliberately use ONE T4. Transformers 4.57 Trainer uses
-# torch.nn.DataParallel for n_gpu>1 in a single process; with a 120k-word MLM head
-# that gathers huge logits onto GPU 0 and can OOM. One T4 avoids that failure mode.
-# The 12-hour Kaggle session limit is still ample for this corpus.
+# One T4 only: avoids DataParallel gathering huge MLM logits onto GPU 0 (OOM).
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 for pkg in [
@@ -44,7 +40,8 @@ for pkg in [
     "datasets>=2.15.0,<5.0.0",
     "accelerate>=1.1.0,<2.0.0",
     "sentencepiece",
-    "nltk"
+    "nltk",
+    "safetensors",
 ]:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
@@ -74,20 +71,21 @@ print(f"Datasets     : {hf_datasets.__version__}")
 print(f"Accelerate   : {accelerate.__version__}")
 
 from transformers import (
-    AutoTokenizer, AutoModelForMaskedLM, BertForMaskedLM,
+    AutoTokenizer, AutoModelForMaskedLM,
     DataCollatorForLanguageModeling,
     TrainingArguments, Trainer,
     EarlyStoppingCallback, set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
 from datasets import Dataset
-from transformers.modeling_outputs import MaskedLMOutput
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO)
 
+
 def warn_and_continue(message):
     print(f"WARNING: {message}")
+
 
 SEED = 42
 set_seed(SEED); random.seed(SEED); np.random.seed(SEED)
@@ -103,42 +101,39 @@ if torch.cuda.is_available():
         print(f"  GPU {i} : {p.name}  {p.total_memory//1024**2} MB")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CELL 2 — Configuration  (edit these if needed)
+# CELL 2 — Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 ROOT = Path(__file__).resolve().parent
 
+
 class CFG:
-    # ── Kaggle Paths ───────────────────────────────────────────────────────────
+    # ── Paths ──────────────────────────────────────────────────────────────────
     DATA_DIR   = ROOT / "data" / "processed"
     MODEL_DIR  = ROOT / "models" / "mbert_adapted"     # OBPE tokenizer + embeddings
     BASE_MODEL = "bert-base-multilingual-cased"        # source of the PRETRAINED MLM head
-                                                       # (or a local path to it)
-    # CSVs that must NOT leak into MLM pre-training (your Phase 7 test/audit data).
-    # Their sentences are also removed from every other file.
-    EXCLUDE_FILES = {"human_audit_sample.csv"}
-    OUT_VOCAB  = "/kaggle/working/out/vocab/gujlish_800tok_model"    # expanded vocab model
-    OUT_MLM    = "/kaggle/working/out/model/gujlish_mlm_final"       # after MLM training
+    EXCLUDE_FILES = {"human_audit_sample.csv"}         # held-out; never used for MLM
+    OUT_VOCAB  = "/kaggle/working/out/vocab/gujlish_800tok_model"
+    OUT_MLM    = "/kaggle/working/out/model/gujlish_mlm_final"
     CKPT_DIR   = "/kaggle/working/out/cp/mlm_checkpoints"
     LOG_DIR    = "/kaggle/working/out/log/mlm_logs"
 
-    # ── CSV column name containing text ───────────────────────────────────────
-    TEXT_COL   = "text"          # change if your CSVs use a different column
+    TEXT_COL   = "text"
 
     # ── Vocabulary expansion ───────────────────────────────────────────────────
-    TARGET_NEW_TOKENS  = 300     # Romanized Gujlish tokens to add
-    MIN_WORD_FREQ      = 20      # ignore words appearing < 20 times (rare ones cannot learn)
-    MIN_SUBWORDS       = 2       # only consider words split into ≥ 2 pieces
-    MAX_WORD_LEN       = 25      # ignore very long tokens (likely noise)
-    SINGLE_WORD_TOKENS = True    # added tokens only match whole words
-    ADD_CAPITALIZED_VARIANTS = True   # also add "Bhai" when "bhai" is added (if frequent)
-    MIN_WORD_LEN       = 3       # ignore very short tokens
+    TARGET_NEW_TOKENS  = 300
+    MIN_WORD_FREQ      = 20
+    MIN_SUBWORDS       = 2
+    MAX_WORD_LEN       = 25
+    SINGLE_WORD_TOKENS = True
+    ADD_CAPITALIZED_VARIANTS = True
+    MIN_WORD_LEN       = 3
 
     # ── MLM Training ──────────────────────────────────────────────────────────
     MAX_SEQ_LEN        = 128
     MLM_PROBABILITY    = 0.15
     NUM_EPOCHS         = 20
-    BATCH_SIZE         = 16      # auto-reduced to 8/4 if the real-batch smoke test OOMs
-    GRAD_ACCUM         = 8       # target effective batch = 128 on the single T4
+    BATCH_SIZE         = 16      # auto-reduced to 8/4 if the smoke test OOMs
+    GRAD_ACCUM         = 8
     TARGET_GLOBAL_BATCH = 128
     EVAL_BATCH_SIZE     = 16
     LEARNING_RATE      = 5e-5
@@ -146,26 +141,24 @@ class CFG:
     WARMUP_RATIO       = 0.06
     LR_SCHEDULER       = "cosine"
     FP16               = True
-    EVAL_RATIO         = 0.02    # 2% for validation
-    EVAL_STEPS         = 400    # ~1 epoch at batch 128
+    EVAL_RATIO         = 0.02
+    EVAL_STEPS         = 400
     SAVE_STEPS         = 400
     SAVE_TOTAL_LIMIT   = 2
     LOGGING_STEPS      = 100
-    EARLY_STOP_PATIENCE = 5      # evals without improvement (~5 epochs)
-    CLEAN_CHECKPOINTS  = True    # delete optimizer checkpoints after the final save
+    EARLY_STOP_PATIENCE = 5
+    CLEAN_CHECKPOINTS  = True
 
     # ── Safety / reproducibility ──────────────────────────────────────────────
     EXPECTED_BASE_M_BERT_VOCAB = 119_547
-    EXPECTED_OBPE_ADDITIONS    = 500
-    # Start clean for the first experiment. Set True ONLY when an actual
-    # training run was interrupted and you intentionally want to resume it.
+    EXPECTED_OBPE_ADDITIONS    = 500      # tokenizer/config: 120,047
     RESUME_FROM_CHECKPOINT     = False
+
 
 for d in [CFG.OUT_VOCAB, CFG.OUT_MLM, CFG.CKPT_DIR, CFG.LOG_DIR]:
     os.makedirs(d, exist_ok=True)
+
 # ── Zero-training API preflight ────────────────────────────────────────────────
-# Fail here, before reading/tokenizing the 50k corpus, if the installed Trainer
-# API does not match the script.
 _required_ta = {
     "output_dir", "overwrite_output_dir", "eval_strategy", "eval_steps",
     "save_strategy", "save_steps", "load_best_model_at_end",
@@ -177,8 +170,7 @@ _missing_ta = sorted(_required_ta - _ta_params)
 if _missing_ta:
     raise RuntimeError(
         "TrainingArguments API preflight failed. "
-        f"Missing parameters: {_missing_ta}. "
-        f"Transformers={transformers.__version__}"
+        f"Missing parameters: {_missing_ta}. Transformers={transformers.__version__}"
     )
 
 _trainer_params = set(inspect.signature(Trainer).parameters)
@@ -200,8 +192,7 @@ _missing_collator = sorted(_required_collator - _collator_params)
 if _missing_collator:
     raise RuntimeError(
         "DataCollatorForLanguageModeling API preflight failed. "
-        f"Missing parameters: {_missing_collator}. "
-        f"Transformers={transformers.__version__}"
+        f"Missing parameters: {_missing_collator}. Transformers={transformers.__version__}"
     )
 
 _mask_params = set(inspect.signature(DataCollatorForLanguageModeling.torch_mask_tokens).parameters)
@@ -245,8 +236,6 @@ _preflight_args = TrainingArguments(
 del _preflight_args
 print("TrainingArguments API preflight: OK")
 
-# NLTK resource preflight. If internet is disabled, the corpus must already be
-# available in the runtime; fail now instead of halfway through the run.
 try:
     nltk.data.find("corpora/words")
 except LookupError:
@@ -263,15 +252,14 @@ except LookupError:
 # CELL 3 — Load Raw Text Corpus
 # ═══════════════════════════════════════════════════════════════════════════════
 def find_text_column(df):
-    """Auto-detect the text column from common names."""
     for col in ["text", "sentence", "comment", "review", "content"]:
         if col in df.columns:
             return col
-    # fallback: first string column
     for col in df.columns:
         if df[col].dtype == object:
             return col
     raise ValueError(f"No text column found. Columns: {list(df.columns)}")
+
 
 def load_corpus(data_dir, text_col):
     texts = []
@@ -299,9 +287,8 @@ def load_corpus(data_dir, text_col):
         except Exception as e:
             print(f"  Skipping {fname}: {e}")
 
-    # Clean
     texts = [s.strip() for s in texts]
-    texts = list(dict.fromkeys(texts))           # deduplicate
+    texts = list(dict.fromkeys(texts))
     texts = [s for s in texts if 10 < len(s) < 5000]
     if held_out:
         n0 = len(texts)
@@ -310,6 +297,7 @@ def load_corpus(data_dir, text_col):
     print(f"\nTotal unique sentences: {len(texts):,}")
     return texts
 
+
 all_texts = load_corpus(CFG.DATA_DIR, CFG.TEXT_COL)
 
 print("\nSample sentences:")
@@ -317,8 +305,11 @@ for s in random.sample(all_texts, min(5, len(all_texts))):
     print(f"  → {s[:120]}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CELL 4 — Load OBPE-Adapted Model + Tokenizer
+# CELL 4 — Load Pretrained MLM Model + Manually Load OBPE-Adapted Weights
 # ═══════════════════════════════════════════════════════════════════════════════
+from safetensors.torch import load_file
+
+
 def find_model_path(primary):
     primary = Path(primary)
     if primary.exists():
@@ -329,17 +320,23 @@ def find_model_path(primary):
         "or update CFG.MODEL_DIR."
     )
 
+
+def load_adapted_state(path):
+    """Read the adapted checkpoint directly (bypasses the config-vs-weights size check).
+    The checkpoint was saved from a classifier: strip 'bert.' prefix, drop classifier.*"""
+    p = Path(path)
+    if (p / "model.safetensors").exists():
+        sd = load_file(str(p / "model.safetensors"))
+    elif (p / "pytorch_model.bin").exists():
+        sd = torch.load(p / "pytorch_model.bin", map_location="cpu")
+    else:
+        raise FileNotFoundError(f"No model.safetensors / pytorch_model.bin in {p}")
+    return {(k[5:] if k.startswith("bert.") else k): v
+            for k, v in sd.items() if not k.startswith("classifier.")}
+
+
 model_path = find_model_path(CFG.MODEL_DIR)
-tokenizer = AutoTokenizer.from_pretrained(
-    model_path,
-    local_files_only=True,
-)
-# --- v2: start from the ORIGINAL pretrained mBERT MLM model -------------------
-# bert-base-multilingual-cased ships a trained MLM head (cls.predictions.*).
-# mbert_adapted does not (it was saved from a classifier), so loading it with
-# AutoModelForMaskedLM gives a RANDOM head. We keep the pretrained head and copy the
-# adapted encoder + OBPE-extended embeddings on top of it.
-from transformers import BertModel
+tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
 
 base_tok = AutoTokenizer.from_pretrained(CFG.BASE_MODEL)
 base_n = CFG.EXPECTED_BASE_M_BERT_VOCAB
@@ -358,7 +355,6 @@ if error_msgs:
 if getattr(model.config, "model_type", None) != "bert" or not hasattr(model, "bert"):
     raise RuntimeError(f"Expected a BERT MaskedLM model, got {getattr(model.config, 'model_type', None)!r}.")
 
-# tied decoder.* may be reported missing; anything else in the head must be present
 missing_mlm_head = [k for k in missing_keys
                     if k.startswith("cls.predictions.") and "decoder" not in k]
 if missing_mlm_head:
@@ -367,24 +363,46 @@ if missing_mlm_head:
     )
 print("✓ Pretrained MLM head loaded from", CFG.BASE_MODEL)
 
-# Grow embeddings/decoder to the OBPE vocab, then copy the adapted encoder in.
+# Grow embeddings/decoder to the OBPE vocab (120,047), then copy adapted weights in.
 model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
 _ref_emb   = model.bert.embeddings.word_embeddings.weight.data[:base_n].clone()
 _ref_layer = model.bert.encoder.layer[-1].output.dense.weight.data.clone()
 
-adapted_bert = BertModel.from_pretrained(model_path, local_files_only=True)  # ignores classifier.*
-load_res = model.bert.load_state_dict(adapted_bert.state_dict(), strict=False)
-if load_res.missing_keys:
-    raise RuntimeError(f"Adapted encoder is missing keys: {load_res.missing_keys[:10]}")
+adapted_sd = load_adapted_state(model_path)
+emb_key = "embeddings.word_embeddings.weight"
+ckpt_rows = adapted_sd[emb_key].shape[0]
+model_rows = model.bert.embeddings.word_embeddings.weight.shape[0]
+print(f"Adapted checkpoint rows: {ckpt_rows:,} | model rows: {model_rows:,} "
+      f"(last {model_rows - ckpt_rows} rows left at default init)")
+if ckpt_rows > model_rows:
+    raise RuntimeError(f"Checkpoint has MORE rows ({ckpt_rows}) than the tokenizer ({model_rows}).")
+
+target_sd = model.bert.state_dict()   # tensors share storage with the real params
+missing = [k for k in target_sd if k not in adapted_sd and "position_ids" not in k]
+if missing:
+    raise RuntimeError(f"Adapted encoder is missing keys: {missing[:10]}")
+
+with torch.no_grad():
+    for k, v in adapted_sd.items():
+        if k not in target_sd:
+            continue
+        if k == emb_key:
+            target_sd[k][:ckpt_rows] = v.to(target_sd[k].dtype)
+        elif target_sd[k].shape == v.shape:
+            target_sd[k].copy_(v)
+        else:
+            raise RuntimeError(f"Shape mismatch for {k}: {tuple(v.shape)} vs {tuple(target_sd[k].shape)}")
+
+model.tie_weights()
+
 _emb_drift   = (model.bert.embeddings.word_embeddings.weight.data[:base_n] - _ref_emb).abs().max().item()
 _layer_drift = (model.bert.encoder.layer[-1].output.dense.weight.data - _ref_layer).abs().max().item()
 print(f"Adapted-vs-original drift: base embeddings {_emb_drift:.3e} | last layer {_layer_drift:.3e}")
 if _emb_drift > 1e-6 or _layer_drift > 1e-6:
     warn_and_continue("mbert_adapted differs from the original mBERT; the pretrained MLM head was "
                       "trained against the original encoder, so expect a higher step-0 loss.")
-del adapted_bert, _ref_emb, _ref_layer
+del adapted_sd, target_sd, _ref_emb, _ref_layer
 gc.collect()
-model.tie_weights()
 
 
 def set_new_output_bias(token_ids, piece_ids_list):
@@ -396,12 +414,11 @@ def set_new_output_bias(token_ids, piece_ids_list):
         for tid, pids in zip(token_ids, piece_ids_list):
             pids = [p for p in pids if p is not None and p < tid and p != tokenizer.unk_token_id]
             bias.data[tid] = bias.data[pids].mean() if pids else fallback
-        if head.bias is not bias:
-            head.bias.data.copy_(bias.data)
+    if head.bias is not bias:
+        head.bias = bias      # keep both references pointing at the same parameter
 
 
-# OBPE tokens (ids base_n .. len(tokenizer)-1): embeddings came from mbert_adapted;
-# give their output bias a sensible start too.
+# OBPE tokens (ids base_n .. len(tokenizer)-1), including the 2 rows without trained embeddings.
 _obpe_ids = list(range(base_n, len(tokenizer)))
 set_new_output_bias(
     _obpe_ids,
@@ -413,7 +430,7 @@ print(f"Initialised output bias for {len(_obpe_ids)} OBPE tokens")
 if unexpected_keys:
     print(f"Note: {len(unexpected_keys)} unused BASE_MODEL keys (e.g. NSP head): {unexpected_keys[:3]}")
 
-print("Multi-GPU DataParallel disabled: using CUDA_VISIBLE_DEVICES=0 (single T4) for stable MLM training")
+print("Multi-GPU DataParallel disabled: using CUDA_VISIBLE_DEVICES=0 (single T4)")
 
 vocab_size_before = len(tokenizer)
 emb_before = model.bert.embeddings.word_embeddings.weight.shape[0]
@@ -424,55 +441,44 @@ assert vocab_size_before == emb_before, (
 )
 
 print(f"Tokenizer vocab size : {vocab_size_before:,}")
-expected_obpe_vocab = (
-    CFG.EXPECTED_BASE_M_BERT_VOCAB + CFG.EXPECTED_OBPE_ADDITIONS
-)
+expected_obpe_vocab = CFG.EXPECTED_BASE_M_BERT_VOCAB + CFG.EXPECTED_OBPE_ADDITIONS
 if vocab_size_before != expected_obpe_vocab:
     raise RuntimeError(
         f"Unexpected source vocabulary size: {vocab_size_before}. "
         f"Expected {expected_obpe_vocab} "
         f"({CFG.EXPECTED_BASE_M_BERT_VOCAB} base + {CFG.EXPECTED_OBPE_ADDITIONS} OBPE)."
     )
-print(
-    f"  ✓ OBPE-adapted confirmed "
-    f"(+{CFG.EXPECTED_OBPE_ADDITIONS} tokens over base mBERT)"
-)
+print(f"  ✓ OBPE-adapted confirmed (+{CFG.EXPECTED_OBPE_ADDITIONS} tokens over base mBERT)")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 5 — Extract Top Romanized Gujlish Tokens
 # ═══════════════════════════════════════════════════════════════════════════════
-# Strategy:
-#   1. Tokenize every word in corpus with current tokenizer
-#   2. Keep only Latin-script words that are fragmented (≥2 pieces)
-#   3. Filter out real English words using NLTK wordlist
-#   4. Rank by  score = log2(freq) × num_subwords
-#   5. Take top TARGET_NEW_TOKENS
-
-print("Downloading NLTK English word list...")
+print("Loading NLTK English word list...")
 nltk.download("words", quiet=True)
 from nltk.corpus import words as nltk_words
 ENGLISH_WORDS = set(w.lower() for w in nltk_words.words())
 print(f"English word list: {len(ENGLISH_WORDS):,} words")
 
-# ── Gujarati Unicode range ─────────────────────────────────────────────────────
 GUJARATI_RANGE = re.compile(r'[\u0A80-\u0AFF]')
-LATIN_WORD     = re.compile(r'^[a-zA-Z][a-zA-Z0-9\'-]{2,}$')  # pure Latin words
+LATIN_WORD     = re.compile(r'^[a-zA-Z][a-zA-Z0-9\'-]{2,}$')
+
 
 def is_romanized_gujlish(word: str) -> bool:
-    """Return True if word is a Latin-script Gujarati/code-mixed word (not English)."""
+    """True if word is a Latin-script Gujarati/code-mixed word (not English)."""
     w = word.strip().lower()
-    if not LATIN_WORD.match(w):              return False  # must be Latin
-    if GUJARATI_RANGE.search(w):             return False  # skip Gujarati script
-    if w in ENGLISH_WORDS:                   return False  # skip real English words
+    if not LATIN_WORD.match(w):              return False
+    if GUJARATI_RANGE.search(w):             return False
+    if w in ENGLISH_WORDS:                   return False
     if len(w) < CFG.MIN_WORD_LEN:            return False
     if len(w) > CFG.MAX_WORD_LEN:            return False
-    if re.search(r"(.)\1{3,}", w):           return False  # spam like "vvvvvvvv"
-    if w.endswith("'s"):                     return False  # English possessives
+    if re.search(r"(.)\1{3,}", w):           return False
+    if w.endswith("'s"):                     return False
     return True
+
 
 print("\nExtracting word frequencies from corpus...")
 word_freq: Counter = Counter()
-raw_freq: Counter = Counter()      # case-sensitive surface forms (for Capitalized variants)
+raw_freq: Counter = Counter()
 for sentence in all_texts:
     for word in sentence.split():
         w_raw = word.strip(".,!?;:\"'()[]{}")
@@ -482,23 +488,17 @@ for sentence in all_texts:
 
 print(f"Unique words in corpus: {len(word_freq):,}")
 
-# ── Find fragmented Romanized Gujlish words ───────────────────────────────────
 print("\nAnalyzing tokenization fragmentation for Romanized words...")
 candidates = {}
-
 for word, freq in word_freq.items():
     if freq < CFG.MIN_WORD_FREQ:
         continue
     if not is_romanized_gujlish(word):
         continue
-
     tokens = tokenizer.tokenize(word)
     n_subwords = len(tokens)
-
     if n_subwords < CFG.MIN_SUBWORDS:
-        continue  # already handled as single token
-
-    # Score = log2(freq) × num_subwords  (same formula as original vocab selection)
+        continue
     score = math.log2(freq) * n_subwords
     candidates[word] = {
         "freq"      : freq,
@@ -509,12 +509,10 @@ for word, freq in word_freq.items():
 
 print(f"Romanized Gujlish candidate words: {len(candidates):,}")
 
-# ── Rank and select top N ──────────────────────────────────────────────────────
 ranked = sorted(candidates.items(), key=lambda x: x[1]["score"], reverse=True)
 
-# Also check that these words are not already in tokenizer vocab
 existing_vocab = set(tokenizer.vocab.keys())
-new_romanized  = []
+new_romanized = []
 for word, info in ranked:
     if word not in existing_vocab and ("##" + word) not in existing_vocab:
         new_romanized.append((word, info))
@@ -546,7 +544,7 @@ original_subword_pieces = {
 print(f"\nTop {len(new_romanized)} Romanized Gujlish tokens selected:")
 print(f"{'Word':<20} {'Freq':>8} {'Subwords':>9} {'Score':>8} {'mBERT splits'}")
 print("-" * 75)
-for word, info in new_romanized[:30]:  # show top 30
+for word, info in new_romanized[:30]:
     splits = " + ".join(info["tokens"])
     print(f"{word:<20} {info['freq']:>8,} {info['subwords']:>9} {info['score']:>8.2f}  {splits}")
 if len(new_romanized) > 30:
@@ -572,23 +570,17 @@ if num_added != len(romanized_words):
     )
     romanized_words = [w for w in romanized_words if tokenizer.convert_tokens_to_ids(w) is not None]
 print(f"  Vocab size: {vocab_size_before:,} → {len(tokenizer):,}")
-print(f"  Total new tokens over base mBERT: +{len(tokenizer) - 119_547}")
+print(f"  Total new tokens over base mBERT: +{len(tokenizer) - CFG.EXPECTED_BASE_M_BERT_VOCAB}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 7 — Resize Embedding Matrix + Mean Initialize New Embeddings
 # ═══════════════════════════════════════════════════════════════════════════════
-# Get the OLD embedding matrix BEFORE resizing
-old_embeddings = model.bert.embeddings.word_embeddings.weight.data.clone()  # [old_vocab, 768]
+old_embeddings = model.bert.embeddings.word_embeddings.weight.data.clone()
 old_vocab_size = old_embeddings.shape[0]
 
-# Resize model embeddings to match new tokenizer vocab.
-# We initialize the new vectors ourselves, so disable Transformers' default
-# mean/covariance initializer to avoid doing unnecessary work twice.
 model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
-
 print(f"\nEmbedding matrix resized: {old_vocab_size:,} → {len(tokenizer):,}")
 
-# ── Mean initialize ONLY the newly added Romanized tokens ────────────────────
 new_embedding_layer = model.bert.embeddings.word_embeddings
 global_mean = old_embeddings.mean(dim=0)
 
@@ -598,18 +590,13 @@ with torch.no_grad():
         token_id = tokenizer.convert_tokens_to_ids(word)
         if token_id is None or token_id < old_vocab_size:
             warn_and_continue(
-                f"Could not initialize newly added token '{word}' (id={token_id}). "
-                "Skipping that token instead of aborting the run."
+                f"Could not initialize newly added token '{word}' (id={token_id}). Skipping."
             )
             continue
 
-        # Use the ORIGINAL decomposition captured before add_tokens().
         subword_pieces = original_subword_pieces.get(word, [])
         piece_ids = tokenizer.convert_tokens_to_ids(subword_pieces)
-        piece_ids = [
-            pid for pid in piece_ids
-            if pid is not None and pid < old_vocab_size
-        ]
+        piece_ids = [pid for pid in piece_ids if pid is not None and pid < old_vocab_size]
 
         if piece_ids:
             new_embedding_layer.weight.data[token_id] = old_embeddings[piece_ids].mean(dim=0)
@@ -621,16 +608,13 @@ with torch.no_grad():
             new_embedding_layer.weight.data[token_id] = global_mean
         initialized_words.append(word)
 
-# BERT MLM input/output word embeddings are tied.
 model.tie_weights()
 
-# Output bias of the new tokens (mean bias of their original pieces).
 set_new_output_bias(
     [tokenizer.convert_tokens_to_ids(w) for w in initialized_words],
     [tokenizer.convert_tokens_to_ids(original_subword_pieces.get(w, [])) for w in initialized_words],
 )
 
-# Fail fast if the 300 new vectors accidentally collapsed to the same vector.
 new_ids = [tokenizer.convert_tokens_to_ids(w) for w in romanized_words]
 new_matrix = new_embedding_layer.weight.data[new_ids]
 pairwise_std = new_matrix.std(dim=0).mean().item()
@@ -641,7 +625,6 @@ if not math.isfinite(pairwise_std) or pairwise_std == 0.0:
     )
 print(f"New-token embedding variability check: {pairwise_std:.6e}")
 
-# ── Final verification ─────────────────────────────────────────────────────────
 final_emb_size = model.bert.embeddings.word_embeddings.weight.shape[0]
 assert final_emb_size == len(tokenizer), (
     f"Mismatch after resize: embedding={final_emb_size}, tokenizer={len(tokenizer)}"
@@ -662,17 +645,14 @@ print(f"  Embedding matrix    : {final_emb_size:,} × 768  ✓")
 tokenizer.save_pretrained(CFG.OUT_VOCAB)
 model.save_pretrained(CFG.OUT_VOCAB)
 
-# Save token list for documentation
 token_info = {
-    "base_mbert_vocab"      : CFG.EXPECTED_BASE_M_BERT_VOCAB,
-    "gujarati_obpe_tokens"  : vocab_size_before - CFG.EXPECTED_BASE_M_BERT_VOCAB,
+    "base_mbert_vocab"        : CFG.EXPECTED_BASE_M_BERT_VOCAB,
+    "gujarati_obpe_tokens"    : vocab_size_before - CFG.EXPECTED_BASE_M_BERT_VOCAB,
     "romanized_gujlish_tokens": num_added,
-    "total_vocab_size"      : len(tokenizer),
-    "total_new_tokens"      : total_added,
-    "romanized_tokens_added": romanized_words,
-    "top30_candidates"      : [
-        {"word": w, **info} for w, info in new_romanized[:30]
-    ],
+    "total_vocab_size"        : len(tokenizer),
+    "total_new_tokens"        : total_added,
+    "romanized_tokens_added"  : romanized_words,
+    "top30_candidates"        : [{"word": w, **info} for w, info in new_romanized[:30]],
 }
 with open(os.path.join(CFG.OUT_VOCAB, "token_expansion_info.json"), "w") as f:
     json.dump(token_info, f, indent=2, ensure_ascii=False)
@@ -693,6 +673,7 @@ print(f"Train: {len(train_texts):,}  |  Eval: {len(eval_texts):,}")
 train_ds = Dataset.from_dict({"text": train_texts})
 eval_ds  = Dataset.from_dict({"text": eval_texts})
 
+
 def tokenize_fn(batch):
     return tokenizer(
         batch["text"],
@@ -702,16 +683,15 @@ def tokenize_fn(batch):
         return_special_tokens_mask=True,
     )
 
+
 print("Tokenizing...")
 tok_train = train_ds.map(tokenize_fn, batched=True, batch_size=1000,
-                          num_proc=2, remove_columns=["text"], desc="Train")
-tok_eval  = eval_ds.map(tokenize_fn,  batched=True, batch_size=1000,
-                          num_proc=2, remove_columns=["text"], desc="Eval")
+                         num_proc=2, remove_columns=["text"], desc="Train")
+tok_eval  = eval_ds.map(tokenize_fn, batched=True, batch_size=1000,
+                        num_proc=2, remove_columns=["text"], desc="Eval")
 
 print(f"Tokenized train: {len(tok_train):,}  |  eval: {len(tok_eval):,}")
 
-# Verify that the newly added tokens actually occur in the tokenized corpus.
-# If a token never appears, its embedding cannot learn from MLM loss.
 new_token_ids = {tokenizer.convert_tokens_to_ids(w): w for w in romanized_words}
 new_token_counts = Counter()
 for ids in tok_train["input_ids"]:
@@ -729,8 +709,8 @@ if missing_in_train:
         + ", ".join(missing_in_train[:20])
     )
 print(
-    f"New-token corpus coverage: min={min(new_token_counts.values())}, "
-    f"max={max(new_token_counts.values())}, "
+    f"New-token corpus coverage: min={min(new_token_counts.values(), default=0)}, "
+    f"max={max(new_token_counts.values(), default=0)}, "
     f"tokens_with_occurrences={sum(v > 0 for v in new_token_counts.values())}/{len(new_token_ids)}"
 )
 
@@ -738,16 +718,10 @@ print(
 # CELL 10 — Data Collator
 # ═══════════════════════════════════════════════════════════════════════════════
 class SafeMLMCollator(DataCollatorForLanguageModeling):
-    """MLM collator that guarantees at least one valid target per example.
+    """MLM collator that guarantees at least one valid target per example, so an
+    eval batch can never have 0 supervised tokens (0/0 -> NaN loss)."""
 
-    With random 15% masking, a short sequence can occasionally receive zero
-    masked tokens. If an entire evaluation batch has no supervised MLM targets,
-    cross-entropy can become 0/0 and return NaN. This preserves normal BERT MLM
-    masking and only forces one target when a row would otherwise have none.
-    """
     def torch_mask_tokens(self, inputs, special_tokens_mask=None, offset_mapping=None):
-        # Transformers 4.57.x passes offset_mapping into this method. Accept it
-        # explicitly and forward it unchanged so the collator stays API-compatible.
         inputs, labels = super().torch_mask_tokens(
             inputs,
             special_tokens_mask=special_tokens_mask,
@@ -766,11 +740,8 @@ class SafeMLMCollator(DataCollatorForLanguageModeling):
                 valid &= ~row_special.to(labels.device).bool()
 
             if not valid.any():
-                # Pathological example containing only special tokens.
-                print(
-                    "WARNING: no non-special token available for forced MLM masking; "
-                    "using position 0 and continuing."
-                )
+                print("WARNING: no non-special token available for forced MLM masking; "
+                      "using position 0 and continuing.")
                 valid[:] = True
 
             pos = int(torch.nonzero(valid, as_tuple=False)[0].item())
@@ -778,22 +749,19 @@ class SafeMLMCollator(DataCollatorForLanguageModeling):
             if self.tokenizer.mask_token_id is not None:
                 inputs[row, pos] = self.tokenizer.mask_token_id
             else:
-                print(
-                    "WARNING: tokenizer has no mask_token_id; forcing an MLM target "
-                    "without replacing the input token."
-                )
+                print("WARNING: tokenizer has no mask_token_id; forcing an MLM target "
+                      "without replacing the input token.")
 
         return inputs, labels
 
 
 data_collator = SafeMLMCollator(
-    tokenizer       = tokenizer,
-    mlm             = True,
-    mlm_probability = CFG.MLM_PROBABILITY,
+    tokenizer          = tokenizer,
+    mlm                = True,
+    mlm_probability    = CFG.MLM_PROBABILITY,
     pad_to_multiple_of = 8 if CFG.FP16 else None,
 )
 
-# Quick sanity check
 sample = data_collator([tok_train[i] for i in range(4)])
 masked = int((sample["labels"] != -100).sum().item())
 total  = sample["input_ids"].numel()
@@ -803,14 +771,15 @@ if masked == 0:
     print("WARNING: collator produced zero MLM targets; continuing, but this is unexpected.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CELL 11 — Training Arguments
+# CELL 11 — Training Arguments (+ batch-size auto-tune)
 # ═══════════════════════════════════════════════════════════════════════════════
 n_gpus = max(torch.cuda.device_count(), 1)
 if n_gpus != 1:
     raise RuntimeError(f"Expected exactly 1 visible GPU after CUDA_VISIBLE_DEVICES=0, got {n_gpus}")
 
-# Auto-tune the micro-batch with an actual longest-sequence batch BEFORE training.
-# This is deliberately more realistic than a 2-example smoke test.
+training_args_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
 def run_real_batch_smoke(batch_size):
     indices = sorted(
         range(len(tok_train)),
@@ -836,8 +805,7 @@ def run_real_batch_smoke(batch_size):
         raise RuntimeError("Real-batch smoke test produced invalid/zero gradients")
     return loss.item(), math.sqrt(grad_sq), batch["input_ids"].shape
 
-# We need a device before TrainingArguments exists. One visible T4 is CUDA device 0.
-training_args_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 model.to(training_args_device)
 chosen_batch = None
 for candidate in [CFG.BATCH_SIZE, 8, 4]:
@@ -870,22 +838,21 @@ approx_global_batch = CFG.BATCH_SIZE * CFG.GRAD_ACCUM
 approx_steps_per_epoch = math.ceil(len(tok_train) / approx_global_batch)
 approx_total_steps = approx_steps_per_epoch * CFG.NUM_EPOCHS
 
-# Verify the evaluation path before the expensive run. The important invariant is
-# that an evaluation batch always contains at least one supervised MLM target.
+
 def verify_eval_batch_has_targets():
     checks = [0, min(4, len(tok_eval) - 1), min(8, len(tok_eval) - 1)]
     for idx in checks:
-        batch_features = [tok_eval[idx]]
-        batch = data_collator(batch_features)
+        batch = data_collator([tok_eval[idx]])
         target_count = int((batch["labels"] != -100).sum().item())
         if target_count == 0:
             print("WARNING: evaluation collator produced zero MLM targets; continuing.")
         else:
             print(f"Evaluation MLM-target check: OK (sample {idx}, targets={target_count})")
 
+
 verify_eval_batch_has_targets()
 
-print(f"\nTraining schedule (safe single-T4 configuration):")
+print(f"\nTraining schedule (single-T4 configuration):")
 print(f"  Visible GPUs         : {n_gpus}")
 print(f"  Per-device batch     : {CFG.BATCH_SIZE}")
 print(f"  Gradient accumulation: {CFG.GRAD_ACCUM}")
@@ -910,7 +877,7 @@ training_args = TrainingArguments(
     warmup_ratio                 = CFG.WARMUP_RATIO,
     fp16                         = CFG.FP16 and torch.cuda.is_available(),
     fp16_full_eval               = False,
-    gradient_checkpointing       = False,  # smoke test already fits without it
+    gradient_checkpointing       = False,
     eval_strategy                = "steps",
     eval_steps                   = CFG.EVAL_STEPS,
     save_strategy                = "steps",
@@ -931,8 +898,7 @@ training_args = TrainingArguments(
     prediction_loss_only         = True,
 )
 
-# Finite-evaluation smoke test: run one real evaluation batch in eval mode.
-# This catches NaN evaluation loss before the full training run starts.
+# Finite-evaluation smoke test (catches NaN eval loss before the expensive run).
 model.eval()
 _eval_features = [tok_eval[i] for i in range(min(CFG.EVAL_BATCH_SIZE, len(tok_eval)))]
 _eval_batch = data_collator(_eval_features)
@@ -958,13 +924,13 @@ if torch.cuda.is_available():
 # CELL 12 — Build Trainer
 # ═══════════════════════════════════════════════════════════════════════════════
 trainer = Trainer(
-    model         = model,
-    args          = training_args,
-    train_dataset = tok_train,
-    eval_dataset  = tok_eval,
+    model            = model,
+    args             = training_args,
+    train_dataset    = tok_train,
+    eval_dataset     = tok_eval,
     processing_class = tokenizer,
-    data_collator = data_collator,
-    callbacks     = [
+    data_collator    = data_collator,
+    callbacks        = [
         EarlyStoppingCallback(
             early_stopping_patience  = CFG.EARLY_STOP_PATIENCE,
             early_stopping_threshold = 0.001,
@@ -973,8 +939,7 @@ trainer = Trainer(
 )
 print("Trainer ready.")
 
-# Step-0 evaluation: with the pretrained head this should already be far below the
-# ~12.9 of the v1 run (random head). If it is ~12+, the head transplant failed.
+# Step-0 evaluation: with the pretrained head this should be far below ~12.9 (random head).
 _init_eval = trainer.evaluate()
 initial_eval_loss = _init_eval["eval_loss"]
 print(f"Step-0 eval loss: {initial_eval_loss:.4f}  (ppl {math.exp(initial_eval_loss):.1f})")
@@ -982,15 +947,14 @@ print(f"Step-0 eval loss: {initial_eval_loss:.4f}  (ppl {math.exp(initial_eval_l
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 13 — TRAIN
 # ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "="*65)
+print("\n" + "=" * 65)
 print("  STARTING MLM PRE-TRAINING")
 print(f"  Vocab size : {len(tokenizer):,}  (+{total_added} over base mBERT)")
 print(f"  Dataset    : {len(tok_train):,} train  |  {len(tok_eval):,} eval")
 print(f"  Epochs     : {CFG.NUM_EPOCHS}")
 print(f"  Started    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-print("="*65 + "\n")
+print("=" * 65 + "\n")
 
-# Auto-resume if Kaggle session restarted
 last_ckpt = (
     get_last_checkpoint(CFG.CKPT_DIR)
     if CFG.RESUME_FROM_CHECKPOINT and os.path.isdir(CFG.CKPT_DIR)
@@ -1009,7 +973,6 @@ print(f"\nTraining finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 trainer.save_model(CFG.OUT_MLM)
 tokenizer.save_pretrained(CFG.OUT_MLM)
 
-# Copy token expansion info to final model folder
 import shutil
 src = os.path.join(CFG.OUT_VOCAB, "token_expansion_info.json")
 shutil.copy(src, CFG.OUT_MLM)
@@ -1021,7 +984,7 @@ trainer.save_metrics("train", train_metrics)
 print(f"Final model saved to: {CFG.OUT_MLM}")
 
 if CFG.CLEAN_CHECKPOINTS:
-    shutil.rmtree(CFG.CKPT_DIR, ignore_errors=True)   # ~2 GB per checkpoint
+    shutil.rmtree(CFG.CKPT_DIR, ignore_errors=True)
     print("Removed intermediate checkpoints.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1031,22 +994,21 @@ eval_metrics = trainer.evaluate()
 eval_loss    = eval_metrics["eval_loss"]
 perplexity   = math.exp(eval_loss)
 
-print(f"\n{'='*50}")
+print(f"\n{'=' * 50}")
 print("  FINAL RESULTS")
-print(f"{'='*50}")
-print(f"  Train loss   : {train_metrics.get('train_loss', 'N/A'):.4f}")
+print(f"{'=' * 50}")
+print(f"  Train loss   : {train_metrics.get('train_loss', float('nan')):.4f}")
 print(f"  Eval loss    : {eval_loss:.4f}")
 print(f"  Perplexity   : {perplexity:.2f}")
-print(f"  Train time   : {train_metrics.get('train_runtime',0)/3600:.2f} hrs")
+print(f"  Train time   : {train_metrics.get('train_runtime', 0)/3600:.2f} hrs")
 print(f"  Vocab size   : {len(tokenizer):,}  (+{total_added} new tokens)")
-print(f"{'='*50}")
+print(f"{'=' * 50}")
 
 if   perplexity < 5:  print("  Excellent — very low perplexity.")
 elif perplexity < 15: print("  Good — reasonable for code-mixed text.")
 elif perplexity < 30: print("  Fair — consider more epochs or data.")
 else:                 print("  Note — high perplexity; check LR and data.")
 
-# Save all metrics
 with open(os.path.join(CFG.OUT_MLM, "mlm_metrics.json"), "w") as f:
     json.dump({
         "train_loss"            : train_metrics.get("train_loss"),
@@ -1063,11 +1025,13 @@ with open(os.path.join(CFG.OUT_MLM, "mlm_metrics.json"), "w") as f:
         "max_seq_len"           : CFG.MAX_SEQ_LEN,
         "mlm_probability"       : CFG.MLM_PROBABILITY,
         "learning_rate"         : CFG.LEARNING_RATE,
+        "adapted_ckpt_embedding_rows": ckpt_rows,
+        "rows_left_at_default_init"  : model_rows - ckpt_rows,
         "missing_mlm_head_keys_at_load": missing_mlm_head,
         "mlm_head_initialized_during_load": bool(missing_mlm_head),
-        "new_tokens_requested": CFG.TARGET_NEW_TOKENS,
-        "new_tokens_selected": len(new_romanized),
-        "new_tokens_added": num_added,
+        "new_tokens_requested"  : CFG.TARGET_NEW_TOKENS,
+        "new_tokens_selected"   : len(new_romanized),
+        "new_tokens_added"      : num_added,
         "new_tokens_initialized": len(initialized_words),
         "new_tokens_missing_from_train": len(missing_in_train),
     }, f, indent=2)
@@ -1112,9 +1076,9 @@ test_sents = [
     "Bhai, aa video bahu [MASK] hato.",
 ]
 
-print("\n" + "="*55)
+print("\n" + "=" * 55)
 print("  FILL-MASK SANITY CHECK")
-print("="*55)
+print("=" * 55)
 for sent in test_sents:
     try:
         results = fill(sent)
@@ -1127,9 +1091,9 @@ for sent in test_sents:
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 18 — Summary and Next Steps
 # ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "="*65)
+print("\n" + "=" * 65)
 print("  DONE — SUMMARY")
-print("="*65)
+print("=" * 65)
 print(f"  Base mBERT vocab     : {CFG.EXPECTED_BASE_M_BERT_VOCAB:,} tokens")
 print(f"  + Gujarati OBPE      : +{vocab_size_before - CFG.EXPECTED_BASE_M_BERT_VOCAB} tokens")
 print(f"  + Romanized Gujlish  : +{num_added} tokens")
@@ -1144,7 +1108,7 @@ print("  3. Compare F1 against:")
 print("     - mBERT baseline          : F1 = 0.7377")
 print("     - mBERT OBPE adapted      : F1 = 0.7372  (no MLM)")
 print("     - THIS MODEL (with MLM)   : F1 = ???  ← expected improvement")
-print("="*65)
+print("=" * 65)
 
 print("\nFiles in output:")
 for f in sorted(os.listdir(CFG.OUT_MLM)):
