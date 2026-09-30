@@ -1040,7 +1040,7 @@ if torch.cuda.is_available():
 from transformers import pipeline
 
 fill = pipeline(
-    "fill-mask", model=CFG.OUT_MLM, tokenizer=CFG.OUT_MLM,
+    "fill-mask", model=str(CFG.OUT_MLM), tokenizer=str(CFG.OUT_MLM),
     device=0 if torch.cuda.is_available() else -1, top_k=5,
 )
 
