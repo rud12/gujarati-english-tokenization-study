@@ -1,0 +1,22 @@
+{
+  "train_loss": 3.5691146347548934,
+  "eval_loss": 3.189460277557373,
+  "perplexity": 24.275321970684328,
+  "train_samples": 24942,
+  "eval_samples": 509,
+  "total_vocab_size": 120345,
+  "new_tokens_total": 798,
+  "gujarati_obpe_tokens": 498,
+  "romanized_new_tokens": 300,
+  "epochs": 7,
+  "max_seq_len": 128,
+  "mlm_probability": 0.15,
+  "learning_rate": 5e-05,
+  "missing_mlm_head_keys_at_load": [],
+  "mlm_head_initialized_during_load": false,
+  "new_tokens_requested": 300,
+  "new_tokens_selected": 300,
+  "new_tokens_added": 300,
+  "new_tokens_initialized": 300,
+  "new_tokens_missing_from_train": 6
+}
