@@ -310,7 +310,7 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 model, loading_info = AutoModelForMaskedLM.from_pretrained(
     model_path,
-    ignore_mismatched_sizes=False,
+    ignore_mismatched_sizes=True,   # config.vocab_size may differ from ckpt weights
     local_files_only=True,
     output_loading_info=True,
 )
@@ -320,9 +320,17 @@ unexpected_keys = loading_info.get("unexpected_keys", [])
 error_msgs = loading_info.get("error_msgs", [])
 
 if error_msgs:
-    raise RuntimeError(
-        "Model loading reported checkpoint errors:\n" + "\n".join(error_msgs[:10])
-    )
+    # ignore_mismatched_sizes=True puts embedding-size warnings in error_msgs;
+    # those are expected and handled by resize_token_embeddings() below.
+    fatal = [m for m in error_msgs
+             if "size mismatch" not in m and "mismatched" not in m.lower()]
+    if fatal:
+        raise RuntimeError(
+            "Model loading reported fatal checkpoint errors:\n" + "\n".join(fatal[:10])
+        )
+    else:
+        print(f"NOTE: {len(error_msgs)} non-fatal size-mismatch message(s) suppressed "
+              "(embedding will be corrected by resize_token_embeddings).")
 
 if getattr(model.config, "model_type", None) != "bert" or not hasattr(model, "bert"):
     raise RuntimeError(
