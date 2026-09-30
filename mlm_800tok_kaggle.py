@@ -116,12 +116,17 @@ class CFG:
     # ── MLM Training ──────────────────────────────────────────────────────────
     MAX_SEQ_LEN        = 128
     MLM_PROBABILITY    = 0.15
-    NUM_EPOCHS         = 3
+    # IMPROVEMENT 1: 3→7 epochs — loss was still 4.11 and declining at epoch 3,
+    #                model was not converged. 7 epochs stays within T4 12-hr limit.
+    NUM_EPOCHS         = 7
     BATCH_SIZE         = 16      # auto-reduced to 8/4 if the real-batch smoke test OOMs
     GRAD_ACCUM         = 8       # target effective batch = 128 on the single T4
     TARGET_GLOBAL_BATCH = 128
     EVAL_BATCH_SIZE     = 4
-    LEARNING_RATE      = 2e-5
+    # IMPROVEMENT 2: 2e-5→5e-5 — continued pre-training needs higher LR than fine-tuning.
+    #                Original BERT used 1e-4; 5e-5 is the standard for domain-adaptive
+    #                pre-training (Gururangan et al. 2020, DAPT paper).
+    LEARNING_RATE      = 5e-5
     WEIGHT_DECAY       = 0.01
     WARMUP_RATIO       = 0.10
     LR_SCHEDULER       = "cosine"
@@ -131,6 +136,11 @@ class CFG:
     SAVE_STEPS         = 250
     SAVE_TOTAL_LIMIT   = 3
     LOGGING_STEPS      = 100
+    # IMPROVEMENT 3: pack 2 short sentences per sequence so masking rate hits ~15%.
+    #                Log showed 7% masking (9/128) because avg YouTube comment
+    #                is ~60 tokens — padding filled the rest, masking was wasted.
+    #                Packing 2 sentences per 128-length example doubles MLM signal.
+    PACK_SEQUENCES     = True
 
     # ── Safety / reproducibility ──────────────────────────────────────────────
     EXPECTED_BASE_M_BERT_VOCAB = 119_547
@@ -587,8 +597,34 @@ train_texts = all_texts[:n_train]
 eval_texts  = all_texts[n_train:]
 print(f"Train: {len(train_texts):,}  |  Eval: {len(eval_texts):,}")
 
-train_ds = Dataset.from_dict({"text": train_texts})
-eval_ds  = Dataset.from_dict({"text": eval_texts})
+# IMPROVEMENT 3: sequence packing ───────────────────────────────────────────
+# YouTube comments average ~60 tokens. With MAX_SEQ_LEN=128, ~50% of each
+# training example was padding, making the effective masking rate ~7% instead
+# of 15%. We pack 2 sentences per example with a [SEP] separator so ~120 of
+# the 128 positions are real tokens and MLM gets full learning signal.
+def pack_texts(texts, sep=" [SEP] ", pack_size=2):
+    """Concatenate pack_size short texts into one longer training example."""
+    packed = []
+    for i in range(0, len(texts) - pack_size + 1, pack_size):
+        packed.append(sep.join(texts[i : i + pack_size]))
+    # handle the leftover tail (< pack_size texts)
+    tail = texts[len(texts) - len(texts) % pack_size :]
+    if tail:
+        packed.append(sep.join(tail))
+    return packed
+
+if getattr(CFG, "PACK_SEQUENCES", False):
+    print("Packing sequences (2 per example) to raise masking rate from 7%→15%...")
+    train_texts_packed = pack_texts(train_texts)
+    eval_texts_packed  = pack_texts(eval_texts)
+    print(f"  Before packing: train={len(train_texts):,}  eval={len(eval_texts):,}")
+    print(f"  After  packing: train={len(train_texts_packed):,}  eval={len(eval_texts_packed):,}")
+else:
+    train_texts_packed = train_texts
+    eval_texts_packed  = eval_texts
+
+train_ds = Dataset.from_dict({"text": train_texts_packed})
+eval_ds  = Dataset.from_dict({"text": eval_texts_packed})
 
 def tokenize_fn(batch):
     return tokenizer(
