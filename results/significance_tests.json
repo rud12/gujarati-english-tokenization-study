@@ -2,21 +2,29 @@
   "adapted_vs_baseline": {
     "comparison": "mBERT (adapted) vs mBERT (baseline)",
     "n_folds_compared": 5,
-    "mean_diff": 0.003362,
-    "cohens_d": 0.9869,
-    "paired_ttest_p": 0.119659,
-    "wilcoxon_p": 0.1875,
-    "significant_ttest": false,
-    "significant_wilcoxon": false
+    "mean_diff": 0.003256,
+    "cohens_d": 2.1946,
+    "cohens_d_ci95_lo": 1.6485,
+    "cohens_d_ci95_hi": 9.7017,
+    "cohens_d_note": "Estimated from n=5 folds; wide CI reflects small sample.",
+    "paired_ttest_p": 0.011789,
+    "wilcoxon_p": null,
+    "wilcoxon_note": "Not computed: n=5 < 6",
+    "significant_ttest": true,
+    "significant_wilcoxon": null
   },
   "muril_vs_baseline": {
     "comparison": "MuRIL (baseline) vs mBERT (baseline)",
     "n_folds_compared": 5,
     "mean_diff": -0.023543,
     "cohens_d": -5.9144,
+    "cohens_d_ci95_lo": -16.1396,
+    "cohens_d_ci95_hi": -4.9112,
+    "cohens_d_note": "Estimated from n=5 folds; wide CI reflects small sample.",
     "paired_ttest_p": 0.000292,
-    "wilcoxon_p": 0.0625,
+    "wilcoxon_p": null,
+    "wilcoxon_note": "Not computed: n=5 < 6",
     "significant_ttest": true,
-    "significant_wilcoxon": false
+    "significant_wilcoxon": null
   }
 }

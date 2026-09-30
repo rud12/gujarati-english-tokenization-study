@@ -5,9 +5,9 @@
     "neutral": 1,
     "positive": 2
   },
-  "dataset_name": "clean_sample_3000.csv",
-  "n_rows": 3000,
-  "n_folds": 3,
+  "dataset_name": "merged_50k",
+  "n_rows": 51161,
+  "n_folds": 5,
   "n_epochs": 5,
   "random_seed": 42
 }
