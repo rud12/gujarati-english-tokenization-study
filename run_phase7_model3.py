@@ -49,6 +49,5 @@ if __name__ == "__main__":
     run_training_pipeline(
         model_name="mBERT_adapted",
         model_path=model_path,
-        checkpoint_dirname="model3",
-        staged_freeze=True,   # freeze BERT body for epoch 1, unfreeze for epochs 2-5
+        checkpoint_dirname="model3"
     )
