@@ -1,14 +1,11 @@
 {
-  "add_cross_attention": false,
   "architectures": [
-    "BertForSequenceClassification"
+    "BertForMaskedLM"
   ],
   "attention_probs_dropout_prob": 0.1,
-  "bos_token_id": null,
   "classifier_dropout": null,
   "directionality": "bidi",
   "dtype": "float32",
-  "eos_token_id": null,
   "hidden_act": "gelu",
   "hidden_dropout_prob": 0.1,
   "hidden_size": 768,
@@ -19,7 +16,6 @@
   },
   "initializer_range": 0.02,
   "intermediate_size": 3072,
-  "is_decoder": false,
   "label2id": {
     "LABEL_0": 0,
     "LABEL_1": 1,
@@ -36,9 +32,9 @@
   "pooler_num_fc_layers": 3,
   "pooler_size_per_head": 128,
   "pooler_type": "first_token_transform",
-  "tie_word_embeddings": true,
-  "transformers_version": "5.17.0",
+  "position_embedding_type": "absolute",
+  "transformers_version": "4.57.6",
   "type_vocab_size": 2,
   "use_cache": true,
-  "vocab_size": 120045
+  "vocab_size": 120345
 }
