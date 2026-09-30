@@ -13,6 +13,19 @@ KAGGLE SETUP:
 
 HOW TO RUN:
   Just click "Run All" — all 18 cells run in sequence automatically.
+
+V2 CHANGES (vs. first run: eval loss 4.05 / ppl 57.5, fill-mask ~ unigram guesses)
+  1. MLM model is built from the ORIGINAL pretrained bert-base-multilingual-cased
+     (which ships a trained MLM head). The OBPE-adapted encoder/embeddings are copied
+     in on top. v1 started from a randomly initialised head (first loss ~13).
+     -> needs BASE_MODEL reachable (Internet ON once, or attach it as a Kaggle Model
+        and point CFG.BASE_MODEL at that path).
+  2. 20 epochs, LR 5e-5, warmup 6%, gradient checkpointing off (was never needed).
+  3. New tokens are added with single_word=True (no matches inside longer words) and
+     Capitalized variants are added too (cased model: "Bhai" != "bhai").
+  4. New-token output biases initialised too; junk tokens (repeated chars, 's) filtered.
+  5. Held-out files are excluded from the MLM corpus (leakage guard).
+  6. Step-0 eval loss is printed, so you can verify the head transplant worked.
 """
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -97,7 +110,12 @@ ROOT = Path(__file__).resolve().parent
 class CFG:
     # ── Kaggle Paths ───────────────────────────────────────────────────────────
     DATA_DIR   = ROOT / "data" / "processed"
-    MODEL_DIR  = ROOT / "models" / "mbert_adapted"
+    MODEL_DIR  = ROOT / "models" / "mbert_adapted"     # OBPE tokenizer + embeddings
+    BASE_MODEL = "bert-base-multilingual-cased"        # source of the PRETRAINED MLM head
+                                                       # (or a local path to it)
+    # CSVs that must NOT leak into MLM pre-training (your Phase 7 test/audit data).
+    # Their sentences are also removed from every other file.
+    EXCLUDE_FILES = {"human_audit_sample.csv"}
     OUT_VOCAB  = "/kaggle/working/out/vocab/gujlish_800tok_model"    # expanded vocab model
     OUT_MLM    = "/kaggle/working/out/model/gujlish_mlm_final"       # after MLM training
     CKPT_DIR   = "/kaggle/working/out/cp/mlm_checkpoints"
@@ -108,43 +126,37 @@ class CFG:
 
     # ── Vocabulary expansion ───────────────────────────────────────────────────
     TARGET_NEW_TOKENS  = 300     # Romanized Gujlish tokens to add
-    MIN_WORD_FREQ      = 5       # ignore words appearing < 5 times
+    MIN_WORD_FREQ      = 20      # ignore words appearing < 20 times (rare ones cannot learn)
     MIN_SUBWORDS       = 2       # only consider words split into ≥ 2 pieces
     MAX_WORD_LEN       = 25      # ignore very long tokens (likely noise)
+    SINGLE_WORD_TOKENS = True    # added tokens only match whole words
+    ADD_CAPITALIZED_VARIANTS = True   # also add "Bhai" when "bhai" is added (if frequent)
     MIN_WORD_LEN       = 3       # ignore very short tokens
 
     # ── MLM Training ──────────────────────────────────────────────────────────
     MAX_SEQ_LEN        = 128
     MLM_PROBABILITY    = 0.15
-    # IMPROVEMENT 1: 3→7 epochs — loss was still 4.11 and declining at epoch 3,
-    #                model was not converged. 7 epochs stays within T4 12-hr limit.
-    NUM_EPOCHS         = 7
+    NUM_EPOCHS         = 20
     BATCH_SIZE         = 16      # auto-reduced to 8/4 if the real-batch smoke test OOMs
     GRAD_ACCUM         = 8       # target effective batch = 128 on the single T4
     TARGET_GLOBAL_BATCH = 128
-    EVAL_BATCH_SIZE     = 4
-    # IMPROVEMENT 2: 2e-5→5e-5 — continued pre-training needs higher LR than fine-tuning.
-    #                Original BERT used 1e-4; 5e-5 is the standard for domain-adaptive
-    #                pre-training (Gururangan et al. 2020, DAPT paper).
+    EVAL_BATCH_SIZE     = 16
     LEARNING_RATE      = 5e-5
     WEIGHT_DECAY       = 0.01
-    WARMUP_RATIO       = 0.10
+    WARMUP_RATIO       = 0.06
     LR_SCHEDULER       = "cosine"
     FP16               = True
     EVAL_RATIO         = 0.02    # 2% for validation
-    EVAL_STEPS         = 250
-    SAVE_STEPS         = 250
-    SAVE_TOTAL_LIMIT   = 3
+    EVAL_STEPS         = 400    # ~1 epoch at batch 128
+    SAVE_STEPS         = 400
+    SAVE_TOTAL_LIMIT   = 2
     LOGGING_STEPS      = 100
-    # IMPROVEMENT 3: pack 2 short sentences per sequence so masking rate hits ~15%.
-    #                Log showed 7% masking (9/128) because avg YouTube comment
-    #                is ~60 tokens — padding filled the rest, masking was wasted.
-    #                Packing 2 sentences per 128-length example doubles MLM signal.
-    PACK_SEQUENCES     = True
+    EARLY_STOP_PATIENCE = 5      # evals without improvement (~5 epochs)
+    CLEAN_CHECKPOINTS  = True    # delete optimizer checkpoints after the final save
 
     # ── Safety / reproducibility ──────────────────────────────────────────────
     EXPECTED_BASE_M_BERT_VOCAB = 119_547
-    EXPECTED_OBPE_ADDITIONS    = 500
+    EXPECTED_OBPE_ADDITIONS    = 498
     # Start clean for the first experiment. Set True ONLY when an actual
     # training run was interrupted and you intentionally want to resume it.
     RESUME_FROM_CHECKPOINT     = False
@@ -263,9 +275,19 @@ def find_text_column(df):
 
 def load_corpus(data_dir, text_col):
     texts = []
+    held_out = set()
     print(f"Scanning {data_dir} ...")
-    for fname in os.listdir(data_dir):
+    for fname in sorted(os.listdir(data_dir)):
         if not fname.endswith(".csv"):
+            continue
+        if fname in CFG.EXCLUDE_FILES:
+            try:
+                _df = pd.read_csv(os.path.join(data_dir, fname))
+                _col = text_col if text_col in _df.columns else find_text_column(_df)
+                held_out.update(_df[_col].dropna().astype(str).str.strip())
+                print(f"  {fname:<45} EXCLUDED (held out, {len(_df):,} rows)")
+            except Exception as e:
+                print(f"  Could not read excluded file {fname}: {e}")
             continue
         path = os.path.join(data_dir, fname)
         try:
@@ -281,6 +303,10 @@ def load_corpus(data_dir, text_col):
     texts = [s.strip() for s in texts]
     texts = list(dict.fromkeys(texts))           # deduplicate
     texts = [s for s in texts if 10 < len(s) < 5000]
+    if held_out:
+        n0 = len(texts)
+        texts = [s for s in texts if s not in held_out]
+        print(f"Removed {n0 - len(texts):,} sentences that also appear in held-out files")
     print(f"\nTotal unique sentences: {len(texts):,}")
     return texts
 
@@ -308,50 +334,84 @@ tokenizer = AutoTokenizer.from_pretrained(
     model_path,
     local_files_only=True,
 )
+# --- v2: start from the ORIGINAL pretrained mBERT MLM model -------------------
+# bert-base-multilingual-cased ships a trained MLM head (cls.predictions.*).
+# mbert_adapted does not (it was saved from a classifier), so loading it with
+# AutoModelForMaskedLM gives a RANDOM head. We keep the pretrained head and copy the
+# adapted encoder + OBPE-extended embeddings on top of it.
+from transformers import BertModel
+
+base_tok = AutoTokenizer.from_pretrained(CFG.BASE_MODEL)
+base_n = CFG.EXPECTED_BASE_M_BERT_VOCAB
+if len(base_tok) != base_n:
+    raise RuntimeError(f"BASE_MODEL tokenizer has {len(base_tok)} tokens, expected {base_n}.")
+
 model, loading_info = AutoModelForMaskedLM.from_pretrained(
-    model_path,
-    ignore_mismatched_sizes=True,   # config.vocab_size may differ from ckpt weights
-    local_files_only=True,
+    CFG.BASE_MODEL,
     output_loading_info=True,
 )
-
 missing_keys = loading_info.get("missing_keys", [])
 unexpected_keys = loading_info.get("unexpected_keys", [])
 error_msgs = loading_info.get("error_msgs", [])
-
 if error_msgs:
-    # ignore_mismatched_sizes=True puts embedding-size warnings in error_msgs;
-    # those are expected and handled by resize_token_embeddings() below.
-    fatal = [m for m in error_msgs
-             if "size mismatch" not in m and "mismatched" not in m.lower()]
-    if fatal:
-        raise RuntimeError(
-            "Model loading reported fatal checkpoint errors:\n" + "\n".join(fatal[:10])
-        )
-    else:
-        print(f"NOTE: {len(error_msgs)} non-fatal size-mismatch message(s) suppressed "
-              "(embedding will be corrected by resize_token_embeddings).")
-
+    raise RuntimeError("Model loading reported checkpoint errors:\n" + "\n".join(error_msgs[:10]))
 if getattr(model.config, "model_type", None) != "bert" or not hasattr(model, "bert"):
-    raise RuntimeError(
-        f"Expected a BERT/mBERT MaskedLM model, got model_type={getattr(model.config, 'model_type', None)!r}."
-    )
+    raise RuntimeError(f"Expected a BERT MaskedLM model, got {getattr(model.config, 'model_type', None)!r}.")
 
-missing_mlm_head = [k for k in missing_keys if k.startswith("cls.predictions.")]
+# tied decoder.* may be reported missing; anything else in the head must be present
+missing_mlm_head = [k for k in missing_keys
+                    if k.startswith("cls.predictions.") and "decoder" not in k]
 if missing_mlm_head:
-    print("WARNING: MLM prediction-head weights are missing from the source checkpoint.")
-    print("         The BERT encoder will be loaded from the checkpoint, while the")
-    print("         missing MLM-head parameters will be initialized by Transformers")
-    print("         and trained during this MLM run.")
-    print("         This is valid training, but it is NOT strict continuation from")
-    print("         a checkpoint that already contained a trained MLM prediction head.")
-    for k in missing_mlm_head:
-        print(f"  missing: {k}")
+    raise RuntimeError(
+        "Pretrained MLM head not found in BASE_MODEL; missing: " + ", ".join(missing_mlm_head)
+    )
+print("✓ Pretrained MLM head loaded from", CFG.BASE_MODEL)
+
+# Grow embeddings/decoder to the OBPE vocab, then copy the adapted encoder in.
+model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+_ref_emb   = model.bert.embeddings.word_embeddings.weight.data[:base_n].clone()
+_ref_layer = model.bert.encoder.layer[-1].output.dense.weight.data.clone()
+
+adapted_bert = BertModel.from_pretrained(model_path, local_files_only=True)  # ignores classifier.*
+load_res = model.bert.load_state_dict(adapted_bert.state_dict(), strict=False)
+if load_res.missing_keys:
+    raise RuntimeError(f"Adapted encoder is missing keys: {load_res.missing_keys[:10]}")
+_emb_drift   = (model.bert.embeddings.word_embeddings.weight.data[:base_n] - _ref_emb).abs().max().item()
+_layer_drift = (model.bert.encoder.layer[-1].output.dense.weight.data - _ref_layer).abs().max().item()
+print(f"Adapted-vs-original drift: base embeddings {_emb_drift:.3e} | last layer {_layer_drift:.3e}")
+if _emb_drift > 1e-6 or _layer_drift > 1e-6:
+    warn_and_continue("mbert_adapted differs from the original mBERT; the pretrained MLM head was "
+                      "trained against the original encoder, so expect a higher step-0 loss.")
+del adapted_bert, _ref_emb, _ref_layer
+gc.collect()
+model.tie_weights()
+
+
+def set_new_output_bias(token_ids, piece_ids_list):
+    """MLM output bias of each new token = mean bias of its original subword pieces."""
+    head = model.cls.predictions
+    bias = head.decoder.bias
+    with torch.no_grad():
+        fallback = bias.data[:base_n].mean()
+        for tid, pids in zip(token_ids, piece_ids_list):
+            pids = [p for p in pids if p is not None and p < tid and p != tokenizer.unk_token_id]
+            bias.data[tid] = bias.data[pids].mean() if pids else fallback
+        if head.bias is not bias:
+            head.bias.data.copy_(bias.data)
+
+
+# OBPE tokens (ids base_n .. len(tokenizer)-1): embeddings came from mbert_adapted;
+# give their output bias a sensible start too.
+_obpe_ids = list(range(base_n, len(tokenizer)))
+set_new_output_bias(
+    _obpe_ids,
+    [base_tok.convert_tokens_to_ids(base_tok.tokenize(tokenizer.convert_ids_to_tokens(i)))
+     for i in _obpe_ids],
+)
+print(f"Initialised output bias for {len(_obpe_ids)} OBPE tokens")
 
 if unexpected_keys:
-    print(f"WARNING: {len(unexpected_keys)} unexpected checkpoint keys found.")
-    for k in unexpected_keys[:20]:
-        print(f"  unexpected: {k}")
+    print(f"Note: {len(unexpected_keys)} unused BASE_MODEL keys (e.g. NSP head): {unexpected_keys[:3]}")
 
 print("Multi-GPU DataParallel disabled: using CUDA_VISIBLE_DEVICES=0 (single T4) for stable MLM training")
 
@@ -406,15 +466,19 @@ def is_romanized_gujlish(word: str) -> bool:
     if w in ENGLISH_WORDS:                   return False  # skip real English words
     if len(w) < CFG.MIN_WORD_LEN:            return False
     if len(w) > CFG.MAX_WORD_LEN:            return False
+    if re.search(r"(.)\1{3,}", w):           return False  # spam like "vvvvvvvv"
+    if w.endswith("'s"):                     return False  # English possessives
     return True
 
 print("\nExtracting word frequencies from corpus...")
 word_freq: Counter = Counter()
+raw_freq: Counter = Counter()      # case-sensitive surface forms (for Capitalized variants)
 for sentence in all_texts:
     for word in sentence.split():
-        w = word.strip(".,!?;:\"'()[]{}").lower()
-        if w:
-            word_freq[w] += 1
+        w_raw = word.strip(".,!?;:\"'()[]{}")
+        if w_raw:
+            raw_freq[w_raw] += 1
+            word_freq[w_raw.lower()] += 1
 
 print(f"Unique words in corpus: {len(word_freq):,}")
 
@@ -464,9 +528,19 @@ if len(new_romanized) != CFG.TARGET_NEW_TOKENS:
     )
 
 # CRITICAL: capture the original WordPiece decomposition BEFORE add_tokens().
+variant_words = []
+if CFG.ADD_CAPITALIZED_VARIANTS:
+    _base_set = {w for w, _ in new_romanized}
+    for w, _ in new_romanized:
+        cap = w[:1].upper() + w[1:]
+        if (cap != w and cap not in _base_set and cap not in existing_vocab
+                and raw_freq.get(cap, 0) >= CFG.MIN_WORD_FREQ):
+            variant_words.append(cap)
+    print(f"Capitalized variants to add: {len(variant_words)}")
+
 original_subword_pieces = {
     word: tokenizer.tokenize(word)
-    for word, _ in new_romanized
+    for word in [w for w, _ in new_romanized] + variant_words
 }
 
 print(f"\nTop {len(new_romanized)} Romanized Gujlish tokens selected:")
@@ -481,10 +555,15 @@ if len(new_romanized) > 30:
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 6 — Add Romanized Tokens to Vocabulary
 # ═══════════════════════════════════════════════════════════════════════════════
-romanized_words = [w for w, _ in new_romanized]
+romanized_words = [w for w, _ in new_romanized] + variant_words
 
 print(f"\nAdding {len(romanized_words)} Romanized Gujlish tokens to vocabulary...")
-num_added = tokenizer.add_tokens(romanized_words)
+from tokenizers import AddedToken
+_to_add = (
+    [AddedToken(w, single_word=True) for w in romanized_words]
+    if CFG.SINGLE_WORD_TOKENS else romanized_words
+)
+num_added = tokenizer.add_tokens(_to_add)
 print(f"  Tokens successfully added: {num_added}")
 if num_added != len(romanized_words):
     warn_and_continue(
@@ -544,6 +623,12 @@ with torch.no_grad():
 
 # BERT MLM input/output word embeddings are tied.
 model.tie_weights()
+
+# Output bias of the new tokens (mean bias of their original pieces).
+set_new_output_bias(
+    [tokenizer.convert_tokens_to_ids(w) for w in initialized_words],
+    [tokenizer.convert_tokens_to_ids(original_subword_pieces.get(w, [])) for w in initialized_words],
+)
 
 # Fail fast if the 300 new vectors accidentally collapsed to the same vector.
 new_ids = [tokenizer.convert_tokens_to_ids(w) for w in romanized_words]
@@ -605,34 +690,8 @@ train_texts = all_texts[:n_train]
 eval_texts  = all_texts[n_train:]
 print(f"Train: {len(train_texts):,}  |  Eval: {len(eval_texts):,}")
 
-# IMPROVEMENT 3: sequence packing ───────────────────────────────────────────
-# YouTube comments average ~60 tokens. With MAX_SEQ_LEN=128, ~50% of each
-# training example was padding, making the effective masking rate ~7% instead
-# of 15%. We pack 2 sentences per example with a [SEP] separator so ~120 of
-# the 128 positions are real tokens and MLM gets full learning signal.
-def pack_texts(texts, sep=" [SEP] ", pack_size=2):
-    """Concatenate pack_size short texts into one longer training example."""
-    packed = []
-    for i in range(0, len(texts) - pack_size + 1, pack_size):
-        packed.append(sep.join(texts[i : i + pack_size]))
-    # handle the leftover tail (< pack_size texts)
-    tail = texts[len(texts) - len(texts) % pack_size :]
-    if tail:
-        packed.append(sep.join(tail))
-    return packed
-
-if getattr(CFG, "PACK_SEQUENCES", False):
-    print("Packing sequences (2 per example) to raise masking rate from 7%→15%...")
-    train_texts_packed = pack_texts(train_texts)
-    eval_texts_packed  = pack_texts(eval_texts)
-    print(f"  Before packing: train={len(train_texts):,}  eval={len(eval_texts):,}")
-    print(f"  After  packing: train={len(train_texts_packed):,}  eval={len(eval_texts_packed):,}")
-else:
-    train_texts_packed = train_texts
-    eval_texts_packed  = eval_texts
-
-train_ds = Dataset.from_dict({"text": train_texts_packed})
-eval_ds  = Dataset.from_dict({"text": eval_texts_packed})
+train_ds = Dataset.from_dict({"text": train_texts})
+eval_ds  = Dataset.from_dict({"text": eval_texts})
 
 def tokenize_fn(batch):
     return tokenizer(
@@ -851,7 +910,7 @@ training_args = TrainingArguments(
     warmup_ratio                 = CFG.WARMUP_RATIO,
     fp16                         = CFG.FP16 and torch.cuda.is_available(),
     fp16_full_eval               = False,
-    gradient_checkpointing       = True,
+    gradient_checkpointing       = False,  # smoke test already fits without it
     eval_strategy                = "steps",
     eval_steps                   = CFG.EVAL_STEPS,
     save_strategy                = "steps",
@@ -907,12 +966,18 @@ trainer = Trainer(
     data_collator = data_collator,
     callbacks     = [
         EarlyStoppingCallback(
-            early_stopping_patience  = 2,
+            early_stopping_patience  = CFG.EARLY_STOP_PATIENCE,
             early_stopping_threshold = 0.001,
         )
     ],
 )
 print("Trainer ready.")
+
+# Step-0 evaluation: with the pretrained head this should already be far below the
+# ~12.9 of the v1 run (random head). If it is ~12+, the head transplant failed.
+_init_eval = trainer.evaluate()
+initial_eval_loss = _init_eval["eval_loss"]
+print(f"Step-0 eval loss: {initial_eval_loss:.4f}  (ppl {math.exp(initial_eval_loss):.1f})")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 13 — TRAIN
@@ -955,6 +1020,10 @@ trainer.save_metrics("train", train_metrics)
 
 print(f"Final model saved to: {CFG.OUT_MLM}")
 
+if CFG.CLEAN_CHECKPOINTS:
+    shutil.rmtree(CFG.CKPT_DIR, ignore_errors=True)   # ~2 GB per checkpoint
+    print("Removed intermediate checkpoints.")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CELL 15 — Evaluate + Perplexity
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -982,6 +1051,7 @@ with open(os.path.join(CFG.OUT_MLM, "mlm_metrics.json"), "w") as f:
     json.dump({
         "train_loss"            : train_metrics.get("train_loss"),
         "eval_loss"             : eval_loss,
+        "initial_eval_loss"     : initial_eval_loss,
         "perplexity"            : perplexity,
         "train_samples"         : len(tok_train),
         "eval_samples"          : len(tok_eval),
@@ -1038,6 +1108,8 @@ test_sents = [
     "Mane aa [MASK] bilkul pasand nathi.",
     "This [MASK] is very good for everyone.",
     "Ekdum [MASK] chhe yaar, maja avi gayi.",
+    "Hu tane bahu [MASK] karu chhu.",
+    "Bhai, aa video bahu [MASK] hato.",
 ]
 
 print("\n" + "="*55)
@@ -1047,7 +1119,7 @@ for sent in test_sents:
     try:
         results = fill(sent)
         print(f"\nInput : {sent}")
-        for r in results[:3]:
+        for r in results[:5]:
             print(f"  [{r['score']:.3f}] {r['sequence']}")
     except Exception as e:
         print(f"Skipped '{sent}': {e}")
