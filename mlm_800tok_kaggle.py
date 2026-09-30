@@ -156,7 +156,7 @@ class CFG:
 
     # ── Safety / reproducibility ──────────────────────────────────────────────
     EXPECTED_BASE_M_BERT_VOCAB = 119_547
-    EXPECTED_OBPE_ADDITIONS    = 498
+    EXPECTED_OBPE_ADDITIONS    = 500
     # Start clean for the first experiment. Set True ONLY when an actual
     # training run was interrupted and you intentionally want to resume it.
     RESUME_FROM_CHECKPOINT     = False
