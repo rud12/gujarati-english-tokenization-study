@@ -56,7 +56,7 @@ BASE_MODEL = "google-bert/bert-base-multilingual-cased"
 # To use a local copy, uncomment:
 # BASE_MODEL = str(ROOT / "models" / "bert_base_multilingual_cased")
 
-OUT_DIR    = Path("/kaggle/working/out/mbert_adapted")   # <- upload this to Kaggle
+OUT_DIR    = Path("/kaggle/working/gujarati-english-tokenization-study/models/mbert_adapted")   # <- upload this to Kaggle
 
 # Must match EXPECTED_OBPE_ADDITIONS in old2mlm_800tok_kaggle.py
 TARGET_OBPE_TOKENS = 498
