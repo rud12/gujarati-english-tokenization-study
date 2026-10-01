@@ -6,7 +6,7 @@
     "positive": 2
   },
   "dataset_name": "merged_50k",
-  "n_rows": 51161,
+  "n_rows": 51155,
   "n_folds": 5,
   "n_epochs": 5,
   "random_seed": 42
